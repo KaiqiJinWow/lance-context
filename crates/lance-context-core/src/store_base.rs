@@ -299,6 +299,8 @@ pub(crate) struct StorageBase {
     /// false negative from a stale manifest, but must never advance a handle
     /// whose caller deliberately selected a historical version.
     pinned_version: Option<u64>,
+    /// A deleted (or partially deleted) handle must never reopen a writer.
+    deleted: bool,
     /// Resident MemWAL writer for this instance's shard, wrapped for `&self`
     /// concurrent access. The [`tokio::sync::Mutex`] is held only to
     /// fetch-or-open and clone the `Arc` (see [`Self::resident_writer`]) and to
@@ -424,6 +426,7 @@ impl StorageBase {
             total_compactions: 0,
             last_compaction_error: None,
             pinned_version: None,
+            deleted: false,
             write_writer: tokio::sync::Mutex::new(None),
         };
         // `ensure_mem_wal` may reload the dataset on a concurrent first-writer
@@ -444,7 +447,7 @@ impl StorageBase {
         self.dataset.manifest.version
     }
 
-    /// Check out a specific base dataset version (time travel).
+    /// Check out a read-only base dataset version. Call `refresh_latest` to resume writes.
     pub async fn checkout(&mut self, version_id: u64) -> LanceResult<()> {
         self.dataset = self.dataset.checkout_version(version_id).await?;
         self.pinned_version = Some(version_id);
@@ -469,10 +472,19 @@ impl StorageBase {
         Ok(())
     }
 
-    /// Mark this handle as no longer pinned after a concrete store mutates the
-    /// dataset directly.
-    pub(crate) fn clear_version_pin(&mut self) {
-        self.pinned_version = None;
+    /// Reject mutations on historical snapshots and on handles being deleted.
+    pub(crate) fn ensure_writable(&self) -> LanceResult<()> {
+        if self.deleted {
+            return Err(LanceError::invalid_input(
+                "store deletion has started; reopen after recreation",
+            ));
+        }
+        if self.is_version_pinned() {
+            return Err(LanceError::invalid_input(
+                "checked-out store is read-only; call refresh_latest before writing",
+            ));
+        }
+        Ok(())
     }
 
     // ---------------------------------------------------------------- writes
@@ -507,6 +519,7 @@ impl StorageBase {
     /// de-duplicated by the key column at read time, so a retried append can
     /// never double-count.
     pub async fn put(&self, batches: Vec<RecordBatch>) -> LanceResult<()> {
+        self.ensure_writable()?;
         if batches.is_empty() {
             return Ok(());
         }
@@ -663,6 +676,19 @@ impl StorageBase {
         Ok(())
     }
 
+    /// Close this handle's writer, then remove the dataset using its configured
+    /// backend. Keep failed deletions retryable while refusing further appends.
+    pub async fn delete_data(&mut self) -> LanceResult<()> {
+        self.deleted = true;
+        self.close().await?;
+        let store = self.dataset.object_store(None).await?;
+        let path = self.dataset.branch_location().path.clone();
+        match store.remove_dir_all(path).await {
+            Err(err) if is_not_found_error(&err) => Ok(()),
+            result => result,
+        }
+    }
+
     /// Rows buffered in this instance's resident writer that have not yet been
     /// sealed into a flushed generation.
     ///
@@ -670,6 +696,9 @@ impl StorageBase {
     /// no memtable, or a fenced writer all report `0` rather than erroring, so
     /// an observability read never fails because of writer state.
     pub async fn unflushed_rows(&self) -> i64 {
+        if self.is_version_pinned() {
+            return 0;
+        }
         let writer = {
             let guard = self.write_writer.lock().await;
             guard.as_ref().cloned()
@@ -769,6 +798,10 @@ impl StorageBase {
         threshold: usize,
         seal_first: bool,
     ) -> LanceResult<Option<(ShardManifestStore, ShardManifest, PreparedMerge)>> {
+        // Periodic maintenance must not advance an explicitly selected snapshot.
+        if self.is_version_pinned() || self.deleted {
+            return Ok(None);
+        }
         if seal_first {
             // Materialize anything buffered so it is eligible for this pass.
             self.flush().await?;
@@ -874,6 +907,10 @@ impl StorageBase {
         manifest: &ShardManifest,
         prepared: PreparedMerge,
     ) -> LanceResult<bool> {
+        // Checkout or deletion may have happened after shared-lock preparation.
+        if self.is_version_pinned() || self.deleted {
+            return Ok(false);
+        }
         let PreparedMerge {
             merged_generations,
             merged_paths,
@@ -1071,6 +1108,7 @@ impl StorageBase {
     /// columns, type changes, and missing required columns remain hard errors.
     /// A no-op when the store declared no `latest_schema`.
     pub async fn ensure_latest_schema(&mut self) -> LanceResult<()> {
+        self.ensure_writable()?;
         let Some(latest_schema) = self.latest_schema.clone() else {
             return Ok(());
         };
@@ -1089,13 +1127,28 @@ impl StorageBase {
             .cloned()
             .collect::<Vec<_>>();
         if !missing_fields.is_empty() {
-            self.dataset
+            if let Err(err) = self
+                .dataset
                 .add_columns(
                     NewColumnTransform::AllNulls(Arc::new(Schema::new(missing_fields))),
                     None,
                     None,
                 )
-                .await?;
+                .await
+            {
+                // Another opener may have committed the same additive upgrade.
+                // Accept that race only after validating the resulting schema.
+                self.refresh_latest().await?;
+                let schema: Arc<Schema> = Arc::new(self.dataset.schema().into());
+                if latest_schema
+                    .fields()
+                    .iter()
+                    .any(|field| schema.field_with_name(field.name()).is_err())
+                {
+                    return Err(err);
+                }
+                align_batch_to_schema(RecordBatch::new_empty(schema), latest_schema)?;
+            }
         }
         Ok(())
     }
@@ -1120,6 +1173,7 @@ impl StorageBase {
         &mut self,
         options: Option<CompactionConfig>,
     ) -> LanceResult<CompactionMetrics> {
+        self.ensure_writable()?;
         let config = options.unwrap_or_default();
 
         let lance_options = CompactionOptions {
@@ -1195,6 +1249,7 @@ impl StorageBase {
     /// rows still living in unmerged WAL generations are found by the normal
     /// scan of those generations.
     pub async fn create_key_zonemap_index(&mut self) -> LanceResult<()> {
+        self.ensure_writable()?;
         info!(column = %self.key_column, "creating ZoneMap index on key column");
         self.dataset
             .create_index_builder(
@@ -1324,6 +1379,10 @@ impl StorageBase {
     /// bounded-concurrent so stores with many writer instances do not pay one
     /// object-store round trip per shard serially.
     pub async fn wal_shard_snapshots(&self) -> LanceResult<Vec<ShardSnapshot>> {
+        // A checked-out version names a base-table snapshot, never the live WAL.
+        if self.is_version_pinned() {
+            return Ok(Vec::new());
+        }
         let object_store = self.dataset.object_store(None).await?;
         let branch_path = self.dataset.branch_location().path.clone();
         let shard_ids = self.dataset.list_mem_wal_latest_shard_ids().await?;
@@ -1405,6 +1464,55 @@ impl StorageBase {
 
     // ------------------------------------------------------------ LSM reads
 
+    /// Read a fresh base/WAL view and retry if a merge invalidates it. A merge
+    /// commits base before draining/deleting its generations, so an unchanged
+    /// base version brackets a successful read. Retry missing generations even
+    /// when the base version is unchanged. Never return a partial result after
+    /// a generation disappears. Ordinary WAL appends do not change base and do
+    /// not force retries. Pinned reads use only their selected base version.
+    pub async fn read_consistent<T, F, Fut>(
+        &self,
+        source: ListSource,
+        mut read: F,
+    ) -> LanceResult<T>
+    where
+        F: FnMut(Dataset, Vec<ShardSnapshot>) -> Fut,
+        Fut: std::future::Future<Output = LanceResult<T>>,
+    {
+        for attempt in 0..3 {
+            let mut dataset = self.dataset.clone();
+            if !self.is_version_pinned() {
+                dataset.checkout_latest().await?;
+            }
+            let version = dataset.manifest.version;
+            let snapshots = if source == ListSource::Fragments {
+                Vec::new()
+            } else {
+                self.wal_shard_snapshots().await?
+            };
+            let result = read(dataset.clone(), snapshots).await;
+            if self.is_version_pinned() {
+                return result;
+            }
+            if let Err(err) = &result {
+                if !is_not_found_error(err) || attempt == 2 {
+                    return result;
+                }
+                // A merge may already have committed before this read began.
+                // Its later WAL GC can invalidate our snapshot without changing
+                // the base version. Refresh both snapshots even in that case.
+                continue;
+            }
+            dataset.checkout_latest().await?;
+            if dataset.manifest.version == version {
+                return result;
+            }
+        }
+        Err(LanceError::io(
+            "dataset changed during read; retry the request",
+        ))
+    }
+
     /// Build an LSM scanner over the base table unioned with every shard's
     /// flushed MemWAL generations, discovered from object storage. Because the
     /// snapshot is rebuilt from shard manifests on each call, one instance sees
@@ -1427,23 +1535,32 @@ impl StorageBase {
         source: ListSource,
         shard_snapshots: Vec<ShardSnapshot>,
     ) -> LsmScanner {
-        let merge_key = vec![self.key_column.clone()];
+        Self::lsm_scanner_for_dataset(&self.dataset, &self.key_column, source, shard_snapshots)
+    }
+
+    pub fn lsm_scanner_for_dataset(
+        dataset: &Dataset,
+        key_column: &str,
+        source: ListSource,
+        shard_snapshots: Vec<ShardSnapshot>,
+    ) -> LsmScanner {
+        let merge_key = vec![key_column.to_string()];
         match source {
             ListSource::Fragments => {
-                LsmScanner::new(Arc::new(self.dataset.clone()), Vec::new(), merge_key)
+                LsmScanner::new(Arc::new(dataset.clone()), Vec::new(), merge_key)
             }
             ListSource::All => {
-                LsmScanner::new(Arc::new(self.dataset.clone()), shard_snapshots, merge_key)
+                LsmScanner::new(Arc::new(dataset.clone()), shard_snapshots, merge_key)
             }
             ListSource::Wal => {
-                let arrow_schema: Schema = self.dataset.schema().into();
+                let arrow_schema: Schema = dataset.schema().into();
                 LsmScanner::without_base_table(
                     Arc::new(arrow_schema),
-                    self.dataset.uri().trim_end_matches('/').to_string(),
+                    dataset.uri().trim_end_matches('/').to_string(),
                     shard_snapshots,
                     merge_key,
                 )
-                .with_session(self.dataset.session())
+                .with_session(dataset.session())
             }
         }
     }

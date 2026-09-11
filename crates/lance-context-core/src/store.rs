@@ -237,6 +237,12 @@ pub struct ContextStore {
     /// one owner. Sharing the base is also what makes clones agree about the
     /// resident writer instead of each opening their own.
     base: StorageBase,
+    /// Keep uniqueness validation and the subsequent visible append atomic
+    /// with respect to other adds through this handle. Separate processes still
+    /// require application-level coordination for globally unique keys.
+    /// Trusted deferred-seal bulk writers opt out of read-back guarantees and
+    /// retain their concurrent append behavior.
+    add_lock: Option<Mutex<()>>,
     compaction_state: Arc<Mutex<CompactionState>>,
     pub compaction_config: CompactionConfig,
     blob_columns: HashSet<String>,
@@ -627,6 +633,7 @@ impl ContextStore {
 
         let mut store = Self {
             base,
+            add_lock: options.seal_on_add.then(|| Mutex::new(())),
             compaction_state: Arc::new(Mutex::new(CompactionState {
                 background_task: None,
                 is_compacting: false,
@@ -677,10 +684,15 @@ impl ContextStore {
 
     /// Append context records to the store and return the new dataset version.
     pub async fn add(&self, entries: &[ContextRecord]) -> LanceResult<u64> {
+        self.base.ensure_writable()?;
         if entries.is_empty() {
             return Ok(self.base.version());
         }
 
+        let _guard = match &self.add_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
         self.validate_unique_ids(entries).await?;
         self.write_entries(entries).await
     }
@@ -738,6 +750,7 @@ impl ContextStore {
     /// then `add` a record whose `payload_uri` points at `uri`. Inline
     /// [`ContextRecord::binary_payload`] remains the small-payload path.
     pub async fn put_payload(&self, uri: &str, bytes: &[u8]) -> LanceResult<u64> {
+        self.base.ensure_writable()?;
         let registry = Arc::new(ObjectStoreRegistry::default());
         let (store, path) =
             ObjectStore::from_uri_and_params(registry, uri, &self.payload_store_params()).await?;
@@ -762,6 +775,7 @@ impl ContextStore {
     /// This writes a tombstone with the same primary key, preserving prior
     /// dataset versions while hiding the record from default reads.
     pub async fn delete_by_id(&mut self, id: &str) -> LanceResult<bool> {
+        self.base.ensure_writable()?;
         let Some(record) = self.get_by_id(id).await? else {
             return Ok(false);
         };
@@ -771,6 +785,7 @@ impl ContextStore {
 
     /// Logically forget a record by caller-supplied external id.
     pub async fn delete_by_external_id(&mut self, external_id: &str) -> LanceResult<bool> {
+        self.base.ensure_writable()?;
         let Some(record) = self.get_by_external_id(external_id).await? else {
             return Ok(false);
         };
@@ -789,6 +804,7 @@ impl ContextStore {
         &mut self,
         mut record: ContextRecord,
     ) -> LanceResult<UpsertResult> {
+        self.base.ensure_writable()?;
         let Some(external_id) = record.external_id.clone() else {
             return Err(ArrowError::InvalidArgumentError(
                 "upsert_by_external_id requires external_id".to_string(),
@@ -877,6 +893,7 @@ impl ContextStore {
         &mut self,
         mut records: Vec<ContextRecord>,
     ) -> LanceResult<Vec<UpsertResult>> {
+        self.base.ensure_writable()?;
         if records.is_empty() {
             return Ok(Vec::new());
         }
@@ -1066,6 +1083,7 @@ impl ContextStore {
         id: &str,
         patch: RecordPatch,
     ) -> LanceResult<Option<UpdateResult>> {
+        self.base.ensure_writable()?;
         if id.is_empty() {
             return Err(ArrowError::InvalidArgumentError(
                 "update_by_id requires a non-empty id".to_string(),
@@ -1089,6 +1107,7 @@ impl ContextStore {
         external_id: &str,
         patch: RecordPatch,
     ) -> LanceResult<Option<UpdateResult>> {
+        self.base.ensure_writable()?;
         if external_id.is_empty() {
             return Err(ArrowError::InvalidArgumentError(
                 "update_by_external_id requires a non-empty external_id".to_string(),
@@ -1394,6 +1413,7 @@ impl ContextStore {
     /// Existing rows are stored as null in the new column and read back as an
     /// empty relationship list.
     pub async fn migrate_relationships_column(&mut self) -> LanceResult<bool> {
+        self.base.ensure_writable()?;
         if self.has_relationships_column() {
             return Ok(false);
         }
@@ -1403,11 +1423,10 @@ impl ContextStore {
             .dataset
             .add_columns(NewColumnTransform::AllNulls(schema), None, None)
             .await?;
-        self.base.clear_version_pin();
         Ok(true)
     }
 
-    /// Checkout a specific dataset version.
+    /// Check out a read-only dataset version. Call `refresh_latest` to resume writes.
     pub async fn checkout(&mut self, version_id: u64) -> LanceResult<()> {
         self.base.checkout(version_id).await
     }
@@ -1980,6 +1999,7 @@ impl ContextStore {
         &mut self,
         options: Option<CompactionConfig>,
     ) -> LanceResult<CompactionMetrics> {
+        self.base.ensure_writable()?;
         let config = options.unwrap_or_else(|| self.compaction_config.clone());
 
         info!(
@@ -2064,6 +2084,12 @@ impl ContextStore {
         self.base.close().await
     }
 
+    /// Stop this handle's writer and delete the dataset through its backend.
+    /// Remote writers must be quiesced by the caller before deletion.
+    pub async fn delete_data(&mut self) -> LanceResult<()> {
+        self.base.delete_data().await
+    }
+
     /// Fold this instance's flushed MemWAL generations into the base table when
     /// it has accumulated [`ContextStoreOptions::merge_after_generations`] of
     /// them. Returns the number reclaimed; a no-op when the trigger is unset.
@@ -2144,6 +2170,7 @@ impl ContextStore {
 
     /// Create (or replace) the scalar index on the `id` column.
     pub async fn create_id_index(&mut self) -> LanceResult<()> {
+        self.base.ensure_writable()?;
         let index_type = match self.id_index_type {
             IdIndexType::ZoneMap => IndexType::ZoneMap,
             IdIndexType::BTree => IndexType::BTree,

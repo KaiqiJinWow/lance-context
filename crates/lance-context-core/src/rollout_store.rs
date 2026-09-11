@@ -471,7 +471,7 @@ impl RolloutStore {
             merge_max_bytes,
             session,
         } = options;
-        let base = StorageBase::open(
+        let mut base = StorageBase::open(
             uri,
             StorageBaseOptions {
                 storage_options,
@@ -495,6 +495,9 @@ impl RolloutStore {
             create_if_missing,
         )
         .await?;
+        // Encoding follows the base schema. Evolve before accepting writes,
+        // otherwise values for newly supported fields are silently discarded.
+        base.ensure_latest_schema().await?;
         Ok(Self { base })
     }
     /// URI of the underlying Lance dataset.
@@ -509,8 +512,9 @@ impl RolloutStore {
         self.base.version()
     }
 
-    /// Checkout a specific dataset version — recovers the exact rollout set that
-    /// trained a checkpoint (spec §3, reproducibility).
+    /// Check out an immutable base-table version. Live WAL generations are
+    /// excluded; unmerged appends are not part of a base version. Writes are
+    /// rejected until `refresh_latest` is called.
     pub async fn checkout(&mut self, version_id: u64) -> LanceResult<()> {
         self.base.checkout(version_id).await
     }
@@ -578,6 +582,7 @@ impl RolloutStore {
     /// visibility; call [`Self::flush`] instead. Retained only for API
     /// compatibility — see the module docs on reproducibility.
     pub async fn add(&self, records: &[RolloutRecord]) -> LanceResult<u64> {
+        self.base.ensure_writable()?;
         if records.is_empty() {
             return Ok(self.base.version());
         }
@@ -600,6 +605,12 @@ impl RolloutStore {
     /// Idempotent. See `StorageBase::close`.
     pub async fn close(&mut self) -> LanceResult<()> {
         self.base.close().await
+    }
+
+    /// Stop this handle's writer and delete the dataset through its backend.
+    /// Remote writers must be quiesced by the caller before deletion.
+    pub async fn delete_data(&mut self) -> LanceResult<()> {
+        self.base.delete_data().await
     }
 
     /// Merge this instance's flushed generations into the base table **if** the
@@ -814,16 +825,35 @@ impl RolloutStore {
         offset: usize,
         source: ListSource,
     ) -> LanceResult<RolloutPage> {
+        self.base
+            .read_consistent(source, |dataset, snapshots| {
+                self.list_filtered_snapshot(filters, limit, offset, source, dataset, snapshots)
+            })
+            .await
+    }
+
+    async fn list_filtered_snapshot(
+        &self,
+        filters: &RolloutFilters,
+        limit: usize,
+        offset: usize,
+        source: ListSource,
+        dataset: Dataset,
+        shard_snapshots: Vec<ShardSnapshot>,
+    ) -> LanceResult<RolloutPage> {
         let filter = filters.expression();
-        let columns = self.non_blob_columns();
+        let columns = Self::non_blob_columns_for(&dataset);
         let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
         let page_limit = limit.saturating_add(1);
 
         if matches!(source, ListSource::Wal | ListSource::All) {
-            let shard_snapshots = self.wal_shard_snapshots().await?;
-            let mut scanner = self
-                .lsm_scanner_for_source(source, shard_snapshots.clone())
-                .project(&["id"])?;
+            let mut scanner = StorageBase::lsm_scanner_for_dataset(
+                &dataset,
+                "id",
+                source,
+                shard_snapshots.clone(),
+            )
+            .project(&["id"])?;
             if let Some(filter) = &filter {
                 scanner = scanner.filter(filter)?;
             }
@@ -862,7 +892,7 @@ impl RolloutStore {
             let has_more = page_ids.len() > limit;
             page_ids.truncate(limit);
             let records = self
-                .take_lsm_page_rows(source, shard_snapshots, page_ids)
+                .take_lsm_page_rows(&dataset, source, shard_snapshots, page_ids)
                 .await?;
             return Ok(RolloutPage { records, has_more });
         }
@@ -879,13 +909,13 @@ impl RolloutStore {
                         "pagination offset exceeds i64::MAX".to_string(),
                     ))
                 })?;
-                let mut scanner = self.base.dataset.scan();
+                let mut scanner = dataset.scan();
                 scanner.project(&refs)?;
                 // Lance 7's late take path can panic on nested list columns.
                 // Keep those early while deferring only potentially large text.
                 scanner.materialization_style(MaterializationStyle::all_early_except(
                     &PAGINATION_LATE_COLUMNS,
-                    self.base.dataset.schema(),
+                    dataset.schema(),
                 )?);
                 if let Some(filter) = &filter {
                     scanner.filter(filter)?;
@@ -906,13 +936,25 @@ impl RolloutStore {
     }
 
     async fn list_all_non_blob_records(&self) -> LanceResult<Vec<RolloutRecord>> {
-        let columns = Arc::new(self.non_blob_columns());
-        let target_schema = Arc::new(projected_arrow_schema(&self.base.dataset, &columns)?);
+        self.base
+            .read_consistent(ListSource::All, |dataset, snapshots| {
+                self.list_non_blob_snapshot(dataset, snapshots)
+            })
+            .await
+    }
+
+    async fn list_non_blob_snapshot(
+        &self,
+        dataset: Dataset,
+        snapshots: Vec<ShardSnapshot>,
+    ) -> LanceResult<Vec<RolloutRecord>> {
+        let columns = Arc::new(Self::non_blob_columns_for(&dataset));
+        let target_schema = Arc::new(projected_arrow_schema(&dataset, &columns)?);
         let mut records_by_id = HashMap::new();
         let mut records = Vec::new();
 
         Self::append_non_blob_records_from_dataset(
-            self.base.dataset.clone(),
+            dataset,
             columns.clone(),
             target_schema.clone(),
             &mut records_by_id,
@@ -920,14 +962,10 @@ impl RolloutStore {
         )
         .await?;
 
-        for snapshot in self.wal_shard_snapshots().await? {
+        for snapshot in snapshots {
             for generation in snapshot.flushed_generations {
                 let uri = self.flushed_generation_uri(snapshot.shard_id, &generation.path);
-                let dataset = match self.open_flushed_dataset(&uri).await {
-                    Ok(dataset) => dataset,
-                    Err(err) if is_not_found_error(&err) => continue,
-                    Err(err) => return Err(err),
-                };
+                let dataset = self.open_flushed_dataset(&uri).await?;
                 Self::append_non_blob_records_from_dataset(
                     dataset,
                     columns.clone(),
@@ -972,6 +1010,7 @@ impl RolloutStore {
     /// take only those rows' non-blob columns.
     async fn take_lsm_page_rows(
         &self,
+        dataset: &Dataset,
         source: ListSource,
         shard_snapshots: Vec<ShardSnapshot>,
         page_ids: Vec<String>,
@@ -980,15 +1019,15 @@ impl RolloutStore {
             return Ok(Vec::new());
         }
 
-        let columns = Arc::new(self.non_blob_columns());
-        let target_schema = Arc::new(projected_arrow_schema(&self.base.dataset, &columns)?);
+        let columns = Arc::new(Self::non_blob_columns_for(dataset));
+        let target_schema = Arc::new(projected_arrow_schema(dataset, &columns)?);
         let id_filter = Arc::new(format!("id IN ({})", sql_quoted_list(&page_ids)));
         let wanted: HashSet<String> = page_ids.iter().cloned().collect();
 
         let mut records_by_id = HashMap::with_capacity(page_ids.len());
         if source == ListSource::All {
             for record in Self::take_page_rows_from_dataset(
-                self.base.dataset.clone(),
+                dataset.clone(),
                 id_filter.clone(),
                 columns.clone(),
                 target_schema.clone(),
@@ -1012,11 +1051,7 @@ impl RolloutStore {
                 let target_schema = target_schema.clone();
                 let id_filter = id_filter.clone();
                 async move {
-                    let dataset = match self.open_flushed_dataset(&uri).await {
-                        Ok(dataset) => dataset,
-                        Err(err) if is_not_found_error(&err) => return Ok(Vec::new()),
-                        Err(err) => return Err(err),
-                    };
+                    let dataset = self.open_flushed_dataset(&uri).await?;
                     Self::take_page_rows_from_dataset(dataset, id_filter, columns, target_schema)
                         .await
                 }
@@ -1413,8 +1448,11 @@ impl RolloutStore {
     /// Top-level column names excluding `binary_payload`, so list-style scans
     /// never materialize artifact bytes.
     fn non_blob_columns(&self) -> Vec<String> {
-        self.base
-            .dataset
+        Self::non_blob_columns_for(&self.base.dataset)
+    }
+
+    fn non_blob_columns_for(dataset: &Dataset) -> Vec<String> {
+        dataset
             .schema()
             .fields
             .iter()
@@ -2113,6 +2151,174 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
+    #[tokio::test]
+    async fn list_retries_when_a_generation_is_deleted_during_the_read() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let writer = RolloutStore::open_with_options(
+            uri,
+            RolloutStoreOptions {
+                shard_id: Some("merge-writer".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let reader = RolloutStore::open_with_options(
+            uri,
+            RolloutStoreOptions {
+                shard_id: Some("read-worker".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        writer
+            .add(&[assistant_record("merged-during-read")])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let writer = tokio::sync::Mutex::new(writer);
+        let attempts = AtomicUsize::new(0);
+        let rows = reader
+            .base
+            .read_consistent(ListSource::All, |dataset, snapshots| {
+                let writer = &writer;
+                let reader = &reader;
+                let attempts = &attempts;
+                async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        writer.lock().await.cleanup_own_shard().await.unwrap();
+                    }
+                    reader.list_non_blob_snapshot(dataset, snapshots).await
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "merged-during-read");
+    }
+
+    #[tokio::test]
+    async fn review_list_retries_when_merge_committed_before_read() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut writer = RolloutStore::open(uri).await.unwrap();
+        let record = assistant_record("already-committed");
+        writer.add(std::slice::from_ref(&record)).await.unwrap();
+        writer.flush().await.unwrap();
+        writer.close().await.unwrap();
+        // Pause a merge after its base commit, before manifest drain and GC.
+        let batch = writer.records_to_batch(&[record]).unwrap();
+        let schema = batch.schema();
+        let batches = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema);
+        writer.base.dataset.append(batches, None).await.unwrap();
+        let reader = RolloutStore::open(uri).await.unwrap();
+        let attempts = AtomicUsize::new(0);
+        let result = reader
+            .base
+            .read_consistent(ListSource::All, |dataset, snapshots| {
+                let reader = &reader;
+                let attempts = &attempts;
+                async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        let snapshot = &snapshots[0];
+                        let store = dataset.object_store(None).await.unwrap();
+                        let path = dataset.branch_location().path.clone();
+                        let manifests = ShardManifestStore::new(
+                            store.clone(),
+                            &path,
+                            snapshot.shard_id,
+                            DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
+                        );
+                        let current = manifests.read_latest().await.unwrap().unwrap();
+                        manifests
+                            .commit_update(current.writer_epoch, |m| ShardManifest {
+                                version: m.version + 1,
+                                flushed_generations: vec![],
+                                ..m.clone()
+                            })
+                            .await
+                            .unwrap();
+                        for generation in &snapshot.flushed_generations {
+                            store
+                                .remove_dir_all(
+                                    path.clone()
+                                        .join("_mem_wal")
+                                        .join(snapshot.shard_id.to_string().as_str())
+                                        .join(generation.path.as_str()),
+                                )
+                                .await
+                                .unwrap();
+                        }
+                    }
+                    reader.list_non_blob_snapshot(dataset, snapshots).await
+                }
+            })
+            .await;
+        assert!(
+            result.is_ok(),
+            "read failed instead of retrying: {result:?}; attempts={}",
+            attempts.load(Ordering::SeqCst)
+        );
+        assert_eq!(result.unwrap().len(), 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn consistent_read_bounds_missing_generation_retries() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = RolloutStore::open(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let attempts = AtomicUsize::new(0);
+        let missing = |_, _| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async {
+                Err::<(), _>(LanceError::dataset_not_found(
+                    "missing-generation",
+                    "missing".into(),
+                ))
+            }
+        };
+        let err = store
+            .base
+            .read_consistent(ListSource::All, missing)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LanceError::DatasetNotFound { .. }));
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+
+        attempts.store(0, Ordering::SeqCst);
+        store.checkout(store.version()).await.unwrap();
+        assert!(store
+            .base
+            .read_consistent(ListSource::All, missing)
+            .await
+            .is_err());
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "pinned reads must not retry against newer snapshots"
+        );
+
+        store.refresh_latest().await.unwrap();
+        attempts.store(0, Ordering::SeqCst);
+        let result = store
+            .base
+            .read_consistent(ListSource::All, |_, _| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                async { Err::<(), _>(LanceError::invalid_input("bad filter")) }
+            })
+            .await;
+        assert!(matches!(result, Err(LanceError::InvalidInput { .. })));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn rollout_filters_parse_supported_fields() {
         let filters = RolloutFilters::from_json_value(json!({
@@ -2270,16 +2476,28 @@ mod tests {
         let legacy_schema = pre_claim_check_schema();
         create_empty_dataset(&uri, legacy_schema.clone()).await;
 
-        let mut store = RolloutStore::open_with_options(
-            &uri,
-            RolloutStoreOptions {
-                shard_id: Some("pre-claim-check".to_string()),
-                merge_after_generations: None,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+        // Model a writer from the old release without running today's open-
+        // time migration, so the fixtures really contain the legacy schema.
+        let mut store = RolloutStore {
+            base: StorageBase::open(
+                &uri,
+                StorageBaseOptions {
+                    storage_options: None,
+                    shard_id: Some("pre-claim-check".to_string()),
+                    merge_after_generations: None,
+                    merge_max_generations: None,
+                    merge_max_bytes: None,
+                    session: None,
+                    schema: legacy_schema.clone(),
+                    key_column: "id".to_string(),
+                    latest_schema: Some(Arc::new(rollout_schema())),
+                    seal_on_put: false,
+                },
+                false,
+            )
+            .await
+            .unwrap(),
+        };
 
         let base_batch = store
             .records_to_batch(&[assistant_record("legacy-base")])

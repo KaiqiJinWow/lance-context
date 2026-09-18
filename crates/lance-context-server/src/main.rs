@@ -85,15 +85,35 @@ async fn main() {
         .await
         .unwrap();
 
-    // Connections have drained. Deterministically close resident rollout writers
-    // (whose `ShardWriter` background tasks need an explicit `close().await`)
+    // Connections have drained. Deterministically close every resident writer
     // before the runtime tears down.
     state.shutdown().await;
 }
 
 async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("failed to install Ctrl+C handler");
-    tracing::info!("Shutting down");
+    #[cfg(unix)]
+    let signal = {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        // Kubernetes and other process managers stop containers with SIGTERM.
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result.expect("failed to install Ctrl+C handler");
+                "SIGINT"
+            }
+            _ = sigterm.recv() => "SIGTERM",
+        }
+    };
+
+    #[cfg(not(unix))]
+    let signal = {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+        "Ctrl+C"
+    };
+
+    tracing::info!(signal, "Shutting down");
 }

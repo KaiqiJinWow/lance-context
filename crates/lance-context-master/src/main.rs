@@ -76,30 +76,29 @@ async fn main() {
         .unwrap();
 }
 
+#[cfg(unix)]
 async fn shutdown_signal() {
-    #[cfg(unix)]
-    let signal = {
-        use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{signal as unix_signal, SignalKind};
 
-        // Kubernetes and other process managers stop containers with SIGTERM.
-        let mut sigterm =
-            signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => {
-                result.expect("failed to install Ctrl+C handler");
-                "SIGINT"
-            }
-            _ = sigterm.recv() => "SIGTERM",
+    // Kubernetes and other process managers stop containers with SIGTERM.
+    let mut sigterm =
+        unix_signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            result.expect("failed to install Ctrl+C handler");
+            tracing::info!(signal = "SIGINT", "Shutting down");
         }
-    };
+        _ = sigterm.recv() => {
+            tracing::info!(signal = "SIGTERM", "Shutting down");
+        }
+    }
+}
 
-    #[cfg(not(unix))]
-    let signal = {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
-        "Ctrl+C"
-    };
-
-    tracing::info!(signal, "Shutting down");
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    tokio::signal::ctrl_c()
+        .await
+        .expect("failed to install Ctrl+C handler");
+    tracing::info!(signal = "Ctrl+C", "Shutting down");
 }

@@ -81,7 +81,7 @@ async fn main() {
 
     let listener = TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(wait_for_shutdown_signal())
         .await
         .unwrap();
 
@@ -91,7 +91,7 @@ async fn main() {
 }
 
 #[cfg(unix)]
-async fn shutdown_signal() {
+async fn wait_for_shutdown_signal() {
     use tokio::signal::unix::{signal as unix_signal, SignalKind};
 
     // Kubernetes and other process managers stop containers with SIGTERM.
@@ -110,7 +110,7 @@ async fn shutdown_signal() {
 }
 
 #[cfg(not(unix))]
-async fn shutdown_signal() {
+async fn wait_for_shutdown_signal() {
     tokio::signal::ctrl_c()
         .await
         .expect("failed to install Ctrl+C handler");

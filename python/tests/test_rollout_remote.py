@@ -109,7 +109,7 @@ def test_remote_filtered_list(server):
                     "rollout_id": "traj-8",
                     "dataset": "dataset-8",
                     "role": "assistant",
-                    "content_type": "application/json",
+                    "content_type": "text/plain",
                     "policy_version": "ckpt-8",
                     "include_in_training": True,
                 },
@@ -118,14 +118,16 @@ def test_remote_filtered_list(server):
 
         rows = await _eventually(
             lambda: store.list(
-                filters={
-                    "dataset": "dataset-7",
-                    "content_type": "application/json",
-                    "include_in_training": True,
-                }
+                filters={"policy_version": "ckpt-7", "include_in_training": True}
             ),
             lambda r: len(r) == 1,
         )
+        assert [row["id"] for row in rows] == ["row-7"]
+
+        rows = await store.list(filters={"dataset": "dataset-7"})
+        assert [row["id"] for row in rows] == ["row-7"]
+
+        rows = await store.list(filters={"content_type": "application/json"})
         assert [row["id"] for row in rows] == ["row-7"]
 
     asyncio.run(run())

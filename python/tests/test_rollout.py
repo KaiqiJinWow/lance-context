@@ -146,24 +146,30 @@ def test_list_filters_before_pagination(store_uri):
                 "id": "row-a",
                 "rollout_id": "traj-a",
                 "problem_id": "problem-a",
+                "dataset": "dataset-a",
                 "policy_version": "ckpt-1",
                 "role": "assistant",
+                "content_type": "application/json",
                 "include_in_training": True,
             },
             {
                 "id": "row-b",
                 "rollout_id": "traj-b",
                 "problem_id": "problem-b",
+                "dataset": "dataset-b",
                 "policy_version": "ckpt-2",
                 "role": "assistant",
+                "content_type": "application/json",
                 "include_in_training": False,
             },
             {
                 "id": "row-c",
                 "rollout_id": "traj-b",
                 "problem_id": "problem-b",
+                "dataset": "dataset-b",
                 "policy_version": "ckpt-2",
                 "role": "artifact",
+                "content_type": "image/png",
                 "artifact_type": "screenshot",
                 "include_in_training": False,
             },
@@ -175,6 +181,11 @@ def test_list_filters_before_pagination(store_uri):
         filters={"policy_version": "ckpt-2", "include_in_training": False}
     )
     assert {row["id"] for row in rows} == {"row-b", "row-c"}
+
+    rows = store.list(
+        filters={"dataset": "dataset-b", "content_type": "application/json"}
+    )
+    assert [row["id"] for row in rows] == ["row-b"]
 
     page = store.list(
         limit=1,

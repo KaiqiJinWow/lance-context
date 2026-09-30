@@ -98,14 +98,18 @@ def test_remote_filtered_list(server):
                 {
                     "id": "row-7",
                     "rollout_id": "traj-7",
+                    "dataset": "dataset-7",
                     "role": "assistant",
+                    "content_type": "application/json",
                     "policy_version": "ckpt-7",
                     "include_in_training": True,
                 },
                 {
                     "id": "row-8",
                     "rollout_id": "traj-8",
+                    "dataset": "dataset-8",
                     "role": "assistant",
+                    "content_type": "application/json",
                     "policy_version": "ckpt-8",
                     "include_in_training": True,
                 },
@@ -114,7 +118,11 @@ def test_remote_filtered_list(server):
 
         rows = await _eventually(
             lambda: store.list(
-                filters={"policy_version": "ckpt-7", "include_in_training": True}
+                filters={
+                    "dataset": "dataset-7",
+                    "content_type": "application/json",
+                    "include_in_training": True,
+                }
             ),
             lambda r: len(r) == 1,
         )

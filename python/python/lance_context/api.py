@@ -2665,9 +2665,10 @@ class RolloutStore:
     ) -> list[dict[str, Any]]:
         """List rollout rows matching exact field filters.
 
-        Supported filter keys are ``rollout_id``, ``problem_id``,
-        ``policy_version``, ``role``, ``include_in_training``, and
-        ``artifact_type``. Artifact bytes remain projected out.
+        Supported filter keys are ``rollout_id``, ``problem_id``, ``dataset``,
+        ``policy_version``, ``role``, ``content_type``,
+        ``include_in_training``, and ``artifact_type``. Artifact bytes remain
+        projected out.
         """
         raw = self._sync.list(limit, offset, _json_dumps(filters, "filters"))
         return [_rollout_record_from_json(r) for r in json.loads(raw)]

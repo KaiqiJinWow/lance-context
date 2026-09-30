@@ -181,8 +181,10 @@ impl RolloutFilters {
             match key.as_str() {
                 "rollout_id" => filters.rollout_id = Some(string_value()?),
                 "problem_id" => filters.problem_id = Some(string_value()?),
+                "dataset" => filters.dataset = Some(string_value()?),
                 "policy_version" => filters.policy_version = Some(string_value()?),
                 "role" => filters.role = Some(string_value()?),
+                "content_type" => filters.content_type = Some(string_value()?),
                 "include_in_training" => {
                     filters.include_in_training = Some(value.as_bool().ok_or_else(|| {
                         "rollout filter 'include_in_training' must be a boolean".to_string()
@@ -2370,8 +2372,10 @@ mod tests {
         let filters = RolloutFilters::from_json_value(json!({
             "rollout_id": "traj-1",
             "problem_id": "problem-7",
+            "dataset": "gsm8k",
             "policy_version": "ckpt-42",
             "role": "assistant",
+            "content_type": "text/plain",
             "include_in_training": false,
             "artifact_type": "screenshot"
         }))
@@ -2379,8 +2383,10 @@ mod tests {
 
         assert_eq!(filters.rollout_id.as_deref(), Some("traj-1"));
         assert_eq!(filters.problem_id.as_deref(), Some("problem-7"));
+        assert_eq!(filters.dataset.as_deref(), Some("gsm8k"));
         assert_eq!(filters.policy_version.as_deref(), Some("ckpt-42"));
         assert_eq!(filters.role.as_deref(), Some("assistant"));
+        assert_eq!(filters.content_type.as_deref(), Some("text/plain"));
         assert_eq!(filters.include_in_training, Some(false));
         assert_eq!(filters.artifact_type.as_deref(), Some("screenshot"));
     }
@@ -2388,6 +2394,8 @@ mod tests {
     #[test]
     fn rollout_filters_reject_unknown_and_wrong_types() {
         assert!(RolloutFilters::from_json_value(json!({"reward": 1.0})).is_err());
+        assert!(RolloutFilters::from_json_value(json!({"dataset": 42})).is_err());
+        assert!(RolloutFilters::from_json_value(json!({"content_type": false})).is_err());
         assert!(RolloutFilters::from_json_value(json!({"policy_version": 42})).is_err());
         assert!(RolloutFilters::from_json_value(json!({"include_in_training": "yes"})).is_err());
         assert!(RolloutFilters::from_json_value(json!([])).is_err());

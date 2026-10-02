@@ -655,6 +655,11 @@ impl RolloutStore {
         self.base.prepare_count_merge().await
     }
 
+    /// Check the configured count trigger using only this shard's manifest.
+    pub async fn count_merge_due(&self) -> LanceResult<bool> {
+        self.base.count_merge_due().await
+    }
+
     /// [`Self::prepare_merge_if_ready`], but seals the active memtable first —
     /// the time-triggered behavior of [`Self::cleanup_own_shard`].
     pub async fn prepare_cleanup_merge(
@@ -2410,6 +2415,223 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn cancelled_merge_joins_inflight_commit_then_retries_without_losing_blob_or_new_wal() {
+        cancellation_recovery_case(false).await;
+    }
+
+    #[tokio::test]
+    async fn recovery_barrier_allows_retry_before_late_old_append_returns() {
+        cancellation_recovery_case(true).await;
+    }
+
+    async fn cancellation_recovery_case(fence_old: bool) {
+        use crate::merge_write_scope::{GuardedCommit, MergeWriteScope};
+        use lance_table::format::{IndexMetadata, Manifest, Transaction};
+        use lance_table::io::commit::{
+            CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme, ManifestWriter,
+        };
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        #[derive(Debug, Default)]
+        struct Gate {
+            closed: AtomicBool,
+            high: AtomicU64,
+        }
+        impl crate::merge_write_scope::CommitAuthorizer for Gate {
+            fn authorize<'a>(
+                &'a self,
+                resource: &'a str,
+                version: u64,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = lance::Result<()>> + Send + 'a>>
+            {
+                Box::pin(async move {
+                    if self.closed.load(Ordering::SeqCst) {
+                        return Err(lance::Error::io("execution fenced"));
+                    }
+                    assert_eq!(resource, "base");
+                    self.high.fetch_max(version, Ordering::SeqCst);
+                    Ok(())
+                })
+            }
+        }
+
+        #[derive(Debug)]
+        struct PausedCommit {
+            inner: Arc<dyn CommitHandler>,
+            once: AtomicBool,
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+        #[async_trait::async_trait]
+        #[allow(clippy::too_many_arguments)]
+        impl CommitHandler for PausedCommit {
+            async fn commit(
+                &self,
+                manifest: &mut Manifest,
+                indices: Option<Vec<IndexMetadata>>,
+                path: &object_store::path::Path,
+                store: &lance_io::object_store::ObjectStore,
+                writer: ManifestWriter,
+                naming: ManifestNamingScheme,
+                transaction: Option<Transaction>,
+            ) -> std::result::Result<ManifestLocation, CommitError> {
+                let appending = transaction.as_ref().is_some_and(|tx| {
+                    matches!(
+                        tx.as_pb().operation,
+                        Some(lance_table::format::pb::transaction::Operation::Append(_))
+                    )
+                });
+                if appending && !self.once.swap(true, Ordering::SeqCst) {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                }
+                self.inner
+                    .commit(manifest, indices, path, store, writer, naming, transaction)
+                    .await
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut store = RolloutStore::open(uri).await.unwrap();
+        let bytes = vec![73u8; 2 * 1024 * 1024];
+        store
+            .add(&[artifact_record("large", &bytes)])
+            .await
+            .unwrap();
+        store.flush().await.unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let handler = Arc::new(GuardedCommit(Arc::new(PausedCommit {
+            inner: lance_table::io::commit::commit_handler_from_url(uri, &None)
+                .await
+                .unwrap(),
+            once: AtomicBool::new(false),
+            entered: entered.clone(),
+            release: release.clone(),
+        })));
+        store.base.dataset = lance::dataset::builder::DatasetBuilder::from_uri(uri)
+            .with_commit_handler(handler)
+            .load()
+            .await
+            .unwrap();
+        let store = Arc::new(tokio::sync::Mutex::new(store));
+        let gate = Arc::new(Gate::default());
+        let scope = MergeWriteScope::with_authorizer(gate.clone());
+        let worker_scope = scope.clone();
+        let writer = store.clone();
+        let merge = tokio::spawn(async move {
+            worker_scope
+                .run(async { writer.lock().await.cleanup_own_shard().await })
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), entered.notified())
+            .await
+            .unwrap();
+        merge.abort();
+        assert!(merge.await.unwrap_err().is_cancelled());
+        let drain_scope = scope.clone();
+        let drain = tokio::spawn(async move { drain_scope.drain().await });
+        tokio::task::yield_now().await;
+        assert!(!drain.is_finished());
+        // Writes arriving after cancellation must survive the eventual retry.
+        {
+            let store = store.lock().await;
+            store
+                .add(&[assistant_record("arrived-during-recovery")])
+                .await
+                .unwrap();
+            store.flush().await.unwrap();
+        }
+        if fence_old {
+            gate.closed.store(true, Ordering::SeqCst);
+            let high = gate.high.load(Ordering::SeqCst);
+            assert!(high > 0);
+            let plan = std::collections::BTreeMap::from([("base".to_string(), high)]);
+            crate::merge_write_scope::fence_manifest_versions(uri, None, &plan, "test-recovery")
+                .await
+                .unwrap();
+            // Recovery must progress while the old storage call is still alive.
+            assert!(!drain.is_finished());
+            let mut next = store.lock().await;
+            next.base.refresh_latest().await.unwrap();
+            assert_eq!(next.base.dataset.count_rows(None).await.unwrap(), 0);
+            next.cleanup_own_shard().await.unwrap();
+            assert_eq!(next.base.dataset.count_rows(None).await.unwrap(), 2);
+            assert_eq!(flushed_generation_count(&next).await, 0);
+        }
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(30), drain)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut store = store.lock().await;
+        if !fence_old {
+            assert!(flushed_generation_count(&store).await > 0);
+        }
+        store.base.refresh_latest().await.unwrap();
+        assert_eq!(
+            store.base.dataset.count_rows(None).await.unwrap(),
+            if fence_old { 2 } else { 1 },
+            "late old append must be rejected after a storage barrier"
+        );
+        store.cleanup_own_shard().await.unwrap();
+        assert_eq!(flushed_generation_count(&store).await, 0);
+        assert_eq!(store.base.dataset.count_rows(None).await.unwrap(), 2);
+        assert_eq!(store.get_blob("large").await.unwrap().unwrap(), bytes);
+        assert!(store
+            .get_by_id("arrived-during-recovery")
+            .await
+            .unwrap()
+            .is_some());
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shard_manifest_barrier_rejects_a_late_drain_and_preserves_new_wal() {
+        use lance::dataset::mem_wal::ShardManifestStore;
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut store = RolloutStore::open(uri).await.unwrap();
+        store.add(&[assistant_record("before")]).await.unwrap();
+        store.flush().await.unwrap();
+        store.add(&[assistant_record("during")]).await.unwrap();
+        store.flush().await.unwrap();
+        let manifests = ShardManifestStore::new(
+            store.base.dataset.object_store(None).await.unwrap(),
+            &store.base.dataset.branch_location().path,
+            store.base.write_shard,
+            16,
+        );
+        let before = manifests.read_latest().await.unwrap().unwrap();
+        let mut late_drain = before.clone();
+        late_drain.version += 1;
+        late_drain.flushed_generations.clear();
+        let plan = std::collections::BTreeMap::from([(
+            format!("shard:{}", store.base.write_shard),
+            late_drain.version,
+        )]);
+        crate::merge_write_scope::fence_manifest_versions(uri, None, &plan, "test-recovery")
+            .await
+            .unwrap();
+        assert!(manifests
+            .write(&late_drain)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("already exists"));
+        let after = manifests.read_latest().await.unwrap().unwrap();
+        assert!(after.version > late_drain.version);
+        assert_eq!(
+            after.writer_epoch, before.writer_epoch,
+            "recovery must not fence live ingest"
+        );
+        assert_eq!(after.flushed_generations, before.flushed_generations);
+        store.cleanup_own_shard().await.unwrap();
+        assert_eq!(flushed_generation_count(&store).await, 0);
+        assert_eq!(store.base.dataset.count_rows(None).await.unwrap(), 2);
+        store.close().await.unwrap();
+    }
+
     fn assistant_record(id: &str) -> RolloutRecord {
         RolloutRecord {
             id: id.to_string(),
@@ -3844,9 +4066,10 @@ mod tests {
 
     #[test]
     fn compact_composes_with_concurrent_wal_merge() {
-        // A base-table compaction (Rewrite) and a WAL merge (Append) are
-        // non-conflicting in Lance's commit matrix: running them concurrently
-        // must not fail, and no rows are lost. Instance A compacts while
+        // Append and Rewrite compose, but preparing the WAL merge can also
+        // CreateIndex. Lance may ask that transaction to retry after Rewrite.
+        // One explicit retry once compaction completes must retain every row.
+        // Instance A compacts while
         // instance B (a different shard) merges its own generations into the
         // same base table.
         use tokio::sync::RwLock;
@@ -3914,12 +4137,27 @@ mod tests {
                 },
             );
             ca.expect("compaction should not fail against a concurrent append");
+            let mb = match mb {
+                Err(LanceError::RetryableCommitConflict { .. }) => {
+                    // The concurrent compactor has completed above. Retry only
+                    // this typed conflict, never arbitrary storage/data errors.
+                    b.write().await.cleanup_own_shard().await
+                }
+                result => result,
+            };
             assert_eq!(mb.expect("wal merge should not fail"), 3);
 
             // A fresh reader sees all 8 rows exactly once.
             let reader = RolloutStore::open(&uri).await.unwrap();
             let listed = reader.list(None, None).await.unwrap();
             assert_eq!(listed.len(), 8);
+            assert_eq!(reader.base.dataset.count_rows(None).await.unwrap(), 8);
+            let ids: std::collections::HashSet<_> = listed.iter().map(|r| r.id.clone()).collect();
+            let expected = (0..5)
+                .map(|i| format!("a-{i}"))
+                .chain((0..3).map(|i| format!("b-{i}")))
+                .collect();
+            assert_eq!(ids, expected);
         });
     }
 

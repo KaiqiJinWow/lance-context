@@ -864,6 +864,23 @@ impl StorageBase {
             .await
     }
 
+    /// Metadata-only count trigger for a coordinated sweeper. Never prepares
+    /// batches or takes a merge-memory reservation just to enqueue work.
+    pub async fn count_merge_due(&self) -> LanceResult<bool> {
+        if self.merge_after_generations == 0 || self.is_version_pinned() || self.deleted {
+            return Ok(false);
+        }
+        let manifest_store = ShardManifestStore::new(
+            self.dataset.object_store(None).await?,
+            &self.dataset.branch_location().path,
+            self.write_shard,
+            DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
+        );
+        Ok(manifest_store.read_latest().await?.is_some_and(|manifest| {
+            manifest.flushed_generations.len() >= self.merge_after_generations
+        }))
+    }
+
     /// [`Self::prepare_merge_if_ready`], but seals the active memtable *before*
     /// consulting the manifest — the time-triggered (`threshold = 1`) behavior
     /// of [`Self::cleanup_own_shard`]. See that method for why the ordering is
@@ -1015,6 +1032,10 @@ impl StorageBase {
             return Ok(false);
         }
 
+        // A prior cancelled merge may have completed a shielded manifest
+        // commit after this handle's future was dropped. Always reopen latest
+        // before retrying, including generic stores without schema evolution.
+        self.refresh_latest().await?;
         self.ensure_latest_schema().await?;
 
         if !batches.is_empty() {
@@ -1035,21 +1056,15 @@ impl StorageBase {
         // writer now owns the shard.
         let epoch = manifest.writer_epoch;
 
+        let drain_store = ShardManifestStore::new(
+            self.dataset.object_store(None).await?,
+            &self.dataset.branch_location().path,
+            self.write_shard,
+            DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
+        );
         observe_phase!(
             "drain",
-            manifest_store
-                .commit_update(epoch, |current| ShardManifest {
-                    version: current.version + 1,
-                    // Relative edit: retain everything we did not merge. Must
-                    // never become an absolute assignment — see the doc comment.
-                    flushed_generations: current
-                        .flushed_generations
-                        .iter()
-                        .filter(|fg| !merged_generations.contains(&fg.generation))
-                        .cloned()
-                        .collect(),
-                    ..current.clone()
-                })
+            crate::merge_write_scope::drain_generations(drain_store, epoch, merged_generations)
                 .await
         )?;
 
@@ -1194,6 +1209,7 @@ impl StorageBase {
             let mut current_batches = Vec::new();
             let mut stream = gen_dataset.scan().try_into_stream().await?;
             while let Some(batch) = stream.try_next().await? {
+                crate::merge_write_scope::checkpoint();
                 if batch.num_rows() > 0 {
                     let batch = align_batch_to_schema(batch, merge_schema.clone())?;
                     buffered_bytes = buffered_bytes.saturating_add(batch.get_array_memory_size());
@@ -2016,7 +2032,15 @@ impl StorageBase {
         storage_options: Option<HashMap<String, String>>,
         session: Option<Arc<Session>>,
     ) -> LanceResult<Dataset> {
-        let mut builder = DatasetBuilder::from_uri(uri);
+        let store_params = storage_options.clone().map(|options| ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                options,
+            ))),
+            ..Default::default()
+        });
+        let handler = lance_table::io::commit::commit_handler_from_url(uri, &store_params).await?;
+        let mut builder = DatasetBuilder::from_uri(uri)
+            .with_commit_handler(Arc::new(crate::merge_write_scope::GuardedCommit(handler)));
         if let Some(options) = storage_options {
             builder = builder.with_storage_options(options);
         }
@@ -2052,6 +2076,9 @@ impl StorageBase {
             });
         }
         params.session = session;
+        let handler =
+            lance_table::io::commit::commit_handler_from_url(uri, &params.store_params).await?;
+        params.commit_handler = Some(Arc::new(crate::merge_write_scope::GuardedCommit(handler)));
 
         Dataset::write(batches, uri, Some(params)).await
     }

@@ -76,6 +76,7 @@ impl<T> StoreHandles<T> {
 }
 
 pub struct AppState {
+    pub merge_executions: crate::merge_execution::Executions,
     pub stores: RwLock<std::collections::HashMap<String, Arc<RwLock<ContextStore>>>>,
     /// Bounded LRU of resident rollout-store handles.
     ///
@@ -321,7 +322,33 @@ impl AppState {
         let datagen_registry = RolloutRegistry::open_or_create(&datagen_registry_uri, None)
             .await
             .map_err(AppError::from_lance)?;
+        config
+            .merge_rollout
+            .validate()
+            .map_err(AppError::InvalidRequest)?;
+        if !config.merge_rollout.owned_targets.is_empty()
+            && config.merge_etcd.etcd_endpoints.is_empty()
+        {
+            return Err(AppError::InvalidRequest(
+                "owned targets require ETCD_ENDPOINTS".into(),
+            ));
+        }
+        if config.merge_execution_timeout_secs == 0
+            || config.merge_queue_timeout_secs == 0
+            || config.merge_idle_timeout_secs == 0
+        {
+            return Err(AppError::InvalidRequest(
+                "merge execution, queue and idle timeouts must be positive".into(),
+            ));
+        }
         Ok(Self {
+            merge_executions: crate::merge_execution::Executions::configured(
+                config.merge_etcd.clone(),
+                config.merge_rollout.clone(),
+                config.merge_execution_timeout_secs,
+                config.merge_queue_timeout_secs,
+                config.merge_idle_timeout_secs,
+            ),
             stores: RwLock::new(std::collections::HashMap::new()),
             rollout_stores: Mutex::new(LruCache::new(capacity)),
             rollout_handles: StoreHandles::default(),
@@ -391,6 +418,7 @@ impl AppState {
             .await
             .expect("open test datagen registry");
         Self {
+            merge_executions: crate::merge_execution::Executions::new(None, 600),
             stores: RwLock::new(std::collections::HashMap::new()),
             rollout_stores: Mutex::new(LruCache::new(
                 NonZeroUsize::new(DEFAULT_ROLLOUT_CACHE_CAPACITY).unwrap(),
@@ -953,17 +981,20 @@ impl AppState {
                 // unswept for hours while their generations piled into the
                 // tens of thousands and every read re-opened all of them.
                 tokio::join!(
-                    sweeper::merge_pass(
+                    sweeper::merge_pass_coordinated(
                         sweeper::resident(&state.rollout_stores).await,
-                        pass_timeout
+                        pass_timeout,
+                        Some(state.clone()),
                     ),
-                    sweeper::merge_pass(
+                    sweeper::merge_pass_coordinated(
                         sweeper::resident(&state.datagen_stores).await,
-                        pass_timeout
+                        pass_timeout,
+                        Some(state.clone()),
                     ),
-                    sweeper::merge_pass(
+                    sweeper::merge_pass_coordinated(
                         sweeper::resident(&state.generic_stores).await,
-                        pass_timeout
+                        pass_timeout,
+                        Some(state.clone()),
                     ),
                 );
             }
@@ -1014,20 +1045,23 @@ impl AppState {
                 // a no-op in steady state; generic stores default to a deferred
                 // seal and genuinely depend on this.
                 tokio::join!(
-                    sweeper::flush_pass(
+                    sweeper::flush_pass_coordinated(
                         sweeper::resident(&state.rollout_stores).await,
                         pass_timeout,
                         state.merge_slots.clone(),
+                        Some(state.clone()),
                     ),
-                    sweeper::flush_pass(
+                    sweeper::flush_pass_coordinated(
                         sweeper::resident(&state.datagen_stores).await,
                         pass_timeout,
                         state.merge_slots.clone(),
+                        Some(state.clone()),
                     ),
-                    sweeper::flush_pass(
+                    sweeper::flush_pass_coordinated(
                         sweeper::resident(&state.generic_stores).await,
                         pass_timeout,
                         state.merge_slots.clone(),
+                        Some(state.clone()),
                     ),
                 );
             }

@@ -32,7 +32,7 @@ use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
 use lance::{Error as LanceError, Result as LanceResult};
 
 /// One entry in the rollout-store directory.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RegistryEntry {
     /// Logical store name (the experiment name); unique key.
     pub name: String,
@@ -40,6 +40,231 @@ pub struct RegistryEntry {
     pub uri: String,
     /// Creation time, Unix milliseconds.
     pub created_at: i64,
+}
+
+/// A directory of stores: `name -> (uri, created_at)`.
+///
+/// The name says which stores exist; the dataset on object storage is the
+/// data. Implementations must be safe to share across tasks (`&self`).
+#[async_trait::async_trait]
+pub trait StoreRegistry: Send + Sync {
+    /// Whether a store named `name` exists.
+    async fn contains(&self, name: &str) -> LanceResult<bool>;
+    /// One directory entry, or `None` when absent.
+    async fn get(&self, name: &str) -> LanceResult<Option<RegistryEntry>>;
+    /// Every entry, in unspecified order.
+    async fn list(&self) -> LanceResult<Vec<RegistryEntry>>;
+    /// Insert or replace the entry for `name`. Idempotent.
+    async fn upsert(&self, name: &str, uri: &str) -> LanceResult<()>;
+    /// Remove the entry for `name`. No-op when absent.
+    async fn remove(&self, name: &str) -> LanceResult<()>;
+    /// Insert every entry whose name is not already registered; returns how
+    /// many were inserted. Existing rows are left unchanged.
+    async fn insert_missing(&self, entries: &[(String, String)]) -> LanceResult<usize>;
+    /// The Lance table behind this registry, if any, so its owner can run
+    /// compaction and version pruning on it. `None` for backends that need no
+    /// maintenance (etcd).
+    fn lance_table(&self) -> Option<&tokio::sync::Mutex<RolloutRegistry>> {
+        None
+    }
+    /// For downcasting to a concrete backend (the master's migration routes
+    /// need the two halves of a [`MirroredRegistry`]).
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+
+/// [`StoreRegistry`] over a [`RolloutRegistry`]. The Lance handle must check
+/// out the latest manifest before every read, hence `&mut self` inside and a
+/// mutex here; every call is one manifest read on object storage.
+pub struct LanceRegistry(pub tokio::sync::Mutex<RolloutRegistry>);
+
+impl LanceRegistry {
+    pub fn new(inner: RolloutRegistry) -> Self {
+        Self(tokio::sync::Mutex::new(inner))
+    }
+}
+
+#[async_trait::async_trait]
+impl StoreRegistry for LanceRegistry {
+    async fn contains(&self, name: &str) -> LanceResult<bool> {
+        self.0.lock().await.contains(name).await
+    }
+    async fn get(&self, name: &str) -> LanceResult<Option<RegistryEntry>> {
+        self.0.lock().await.get(name).await
+    }
+    async fn list(&self) -> LanceResult<Vec<RegistryEntry>> {
+        self.0.lock().await.list().await
+    }
+    async fn upsert(&self, name: &str, uri: &str) -> LanceResult<()> {
+        self.0.lock().await.upsert(name, uri).await
+    }
+    async fn remove(&self, name: &str) -> LanceResult<()> {
+        self.0.lock().await.remove(name).await
+    }
+    async fn insert_missing(&self, entries: &[(String, String)]) -> LanceResult<usize> {
+        self.0.lock().await.insert_missing(entries).await
+    }
+    fn lance_table(&self) -> Option<&tokio::sync::Mutex<RolloutRegistry>> {
+        Some(&self.0)
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// Lance primary with a versioned etcd mirror. Failed mirror writes do not
+/// fail the primary mutation; a complete snapshot reconciliation repairs them.
+/// Reverse mirroring is deliberately unsupported.
+pub struct MirroredRegistry {
+    pub primary: Arc<dyn StoreRegistry>,
+    pub mirror: Arc<dyn StoreRegistry>,
+    pub label: &'static str,
+}
+
+impl MirroredRegistry {
+    async fn sync_name(&self, name: &str) -> LanceResult<()> {
+        let (source, target) = migration_pair(&*self.primary, &*self.mirror)?;
+        let (uri, version, entry) = {
+            let mut source = source.0.lock().await;
+            let entry = source.get(name).await?;
+            (source.uri.clone(), source.dataset.version().version, entry)
+        };
+        target
+            .apply_source(&uri, version, name, entry.as_ref())
+            .await?;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl StoreRegistry for MirroredRegistry {
+    async fn contains(&self, name: &str) -> LanceResult<bool> {
+        self.primary.contains(name).await
+    }
+    async fn get(&self, name: &str) -> LanceResult<Option<RegistryEntry>> {
+        self.primary.get(name).await
+    }
+    async fn list(&self) -> LanceResult<Vec<RegistryEntry>> {
+        self.primary.list().await
+    }
+    async fn upsert(&self, name: &str, uri: &str) -> LanceResult<()> {
+        self.primary.upsert(name, uri).await?;
+        if let Err(error) = self.sync_name(name).await {
+            tracing::warn!(registry = self.label, name, %error, "registry mirror upsert failed");
+        }
+        Ok(())
+    }
+    async fn remove(&self, name: &str) -> LanceResult<()> {
+        self.primary.remove(name).await?;
+        if let Err(error) = self.sync_name(name).await {
+            tracing::warn!(registry = self.label, name, %error, "registry mirror remove failed");
+        }
+        Ok(())
+    }
+    async fn insert_missing(&self, entries: &[(String, String)]) -> LanceResult<usize> {
+        let inserted = self.primary.insert_missing(entries).await?;
+        if let Err(error) = backfill_registry(&*self.primary, &*self.mirror).await {
+            tracing::warn!(registry = self.label, %error, "registry mirror reconciliation failed");
+        }
+        Ok(inserted)
+    }
+    fn lance_table(&self) -> Option<&tokio::sync::Mutex<RolloutRegistry>> {
+        self.primary.lance_table()
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+fn migration_pair<'a>(
+    from: &'a dyn StoreRegistry,
+    to: &'a dyn StoreRegistry,
+) -> LanceResult<(&'a LanceRegistry, &'a crate::EtcdRegistry)> {
+    match (
+        from.as_any().downcast_ref::<LanceRegistry>(),
+        to.as_any().downcast_ref::<crate::EtcdRegistry>(),
+    ) {
+        (Some(source), Some(target)) => Ok((source, target)),
+        _ => Err(LanceError::io(
+            "registry reconciliation supports only Lance -> etcd",
+        )),
+    }
+}
+
+/// Reconcile one consistent Lance snapshot, including changed values and
+/// deletions. The source version fences delayed older snapshots and point
+/// updates at the destination. The return value counts changed entries.
+pub async fn backfill_registry(
+    from: &dyn StoreRegistry,
+    to: &dyn StoreRegistry,
+) -> LanceResult<usize> {
+    let (source, target) = migration_pair(from, to)?;
+    let (uri, version, entries) = {
+        let mut source = source.0.lock().await;
+        let entries = source.list().await?;
+        (
+            source.uri.clone(),
+            source.dataset.version().version,
+            entries,
+        )
+    };
+    target.reconcile_source(&uri, version, &entries).await
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct RegistryMismatch {
+    pub name: String,
+    pub primary: RegistryEntry,
+    pub mirror: RegistryEntry,
+}
+
+/// A metadata comparison, not authorization to switch live writers.
+#[derive(Debug, serde::Serialize)]
+pub struct RegistryDiff {
+    pub only_in_primary: Vec<String>,
+    pub only_in_mirror: Vec<String>,
+    pub mismatched: Vec<RegistryMismatch>,
+}
+
+impl RegistryDiff {
+    pub fn is_empty(&self) -> bool {
+        self.only_in_primary.is_empty()
+            && self.only_in_mirror.is_empty()
+            && self.mismatched.is_empty()
+    }
+}
+
+pub async fn diff_registries(
+    a: &dyn StoreRegistry,
+    b: &dyn StoreRegistry,
+) -> LanceResult<RegistryDiff> {
+    let a: std::collections::BTreeMap<_, _> = a
+        .list()
+        .await?
+        .into_iter()
+        .map(|e| (e.name.clone(), e))
+        .collect();
+    let b: std::collections::BTreeMap<_, _> = b
+        .list()
+        .await?
+        .into_iter()
+        .map(|e| (e.name.clone(), e))
+        .collect();
+    Ok(RegistryDiff {
+        only_in_primary: a.keys().filter(|n| !b.contains_key(*n)).cloned().collect(),
+        only_in_mirror: b.keys().filter(|n| !a.contains_key(*n)).cloned().collect(),
+        mismatched: a
+            .iter()
+            .filter_map(|(name, primary)| {
+                b.get(name)
+                    .filter(|mirror| *mirror != primary)
+                    .map(|mirror| RegistryMismatch {
+                        name: name.clone(),
+                        primary: primary.clone(),
+                        mirror: mirror.clone(),
+                    })
+            })
+            .collect(),
+    })
 }
 
 /// Durable directory of rollout stores, backed by a single Lance dataset.

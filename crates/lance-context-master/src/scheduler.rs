@@ -979,15 +979,14 @@ mod tests {
             task_cooldown_after_failures: 3,
             task_cooldown_base_secs: 600,
             task_cooldown_max_secs: 21_600,
-            etcd_endpoints: std::env::var("ETCD_TEST_ENDPOINTS")
-                .map(|value| value.split(',').map(str::to_string).collect())
-                .unwrap_or_default(),
-            etcd_prefix: format!("/lance-context/test/{}", generate_id()),
-            etcd_username: None,
-            etcd_password: None,
-            etcd_ca_cert: None,
-            etcd_client_cert: None,
-            etcd_client_key: None,
+            etcd: lance_context_core::etcd::EtcdConfig {
+                etcd_endpoints: std::env::var("ETCD_TEST_ENDPOINTS")
+                    .map(|value| value.split(',').map(str::to_string).collect())
+                    .unwrap_or_default(),
+                etcd_prefix: format!("/lance-context/test/{}", generate_id()),
+                ..Default::default()
+            },
+            registry: lance_context_core::etcd::RegistryConfig::default(),
             etcd_lease_ttl_secs: 5,
             task_history_limit: 1_000,
             task_history_ttl_secs: 86_400,
@@ -1006,13 +1005,7 @@ mod tests {
         let mut store = RolloutStore::open(&uri).await.unwrap();
         store.add(&[rollout_record("a")]).await.unwrap();
         store.cleanup_own_shard().await.unwrap();
-        state
-            .registry
-            .write()
-            .await
-            .upsert("exp", &uri)
-            .await
-            .unwrap();
+        state.registry.upsert("exp", &uri).await.unwrap();
         crate::scanner::scan_once(&state).await.unwrap();
         let metrics = compact_inner(&state, "exp").await.unwrap();
         assert_eq!(metrics.fragments_removed, 0);
@@ -1221,13 +1214,7 @@ mod tests {
                 store.cleanup_own_shard().await.unwrap();
             }
         }
-        state
-            .registry
-            .write()
-            .await
-            .upsert(name, &uri)
-            .await
-            .unwrap();
+        state.registry.upsert(name, &uri).await.unwrap();
         // Seed a stats row so post-compaction upsert has a prior counter.
         crate::scanner::scan_once(&state).await.unwrap();
 
@@ -1275,13 +1262,7 @@ mod tests {
                 store.cleanup_own_shard().await.unwrap();
             }
         }
-        state
-            .registry
-            .write()
-            .await
-            .upsert(name, &uri)
-            .await
-            .unwrap();
+        state.registry.upsert(name, &uri).await.unwrap();
         crate::scanner::scan_once(&state).await.unwrap();
 
         let compact = enqueue(&state, TaskKind::Compact, name).await.unwrap();
@@ -1395,13 +1376,7 @@ mod tests {
             store.cleanup_own_shard().await.unwrap();
             assert!(!store.has_id_btree_index().await.unwrap());
         }
-        state
-            .registry
-            .write()
-            .await
-            .upsert(name, &uri)
-            .await
-            .unwrap();
+        state.registry.upsert(name, &uri).await.unwrap();
 
         let rec = enqueue(&state, TaskKind::MergeWal, name).await.unwrap();
         assert_eq!(await_terminal(&state, &rec.id).await.state, TaskState::Done);
@@ -1472,13 +1447,7 @@ mod tests {
                 .join(format!("{name}.rollout.lance/data/{victim_path}")),
         )
         .unwrap();
-        state
-            .registry
-            .write()
-            .await
-            .upsert(name, &uri)
-            .await
-            .unwrap();
+        state.registry.upsert(name, &uri).await.unwrap();
         crate::scanner::scan_once(&state).await.unwrap();
 
         let compact = enqueue(&state, TaskKind::Compact, name).await.unwrap();
@@ -1564,13 +1533,7 @@ mod tests {
                 store.cleanup_own_shard().await.unwrap();
             }
         }
-        state
-            .registry
-            .write()
-            .await
-            .upsert(name, &uri)
-            .await
-            .unwrap();
+        state.registry.upsert(name, &uri).await.unwrap();
 
         let rec = enqueue(&state, TaskKind::IndexId, name).await.unwrap();
         let status = await_terminal(&state, &rec.id).await;
@@ -1616,10 +1579,10 @@ mod tests {
         };
         use lance_context_merge::{Coordinator, Execution};
         use tower::ServiceExt;
-        let client = etcd_client::Client::connect(cfg.etcd_endpoints.clone(), None)
+        let client = etcd_client::Client::connect(cfg.etcd.etcd_endpoints.clone(), None)
             .await
             .unwrap();
-        let coordinator = Coordinator::new(client, cfg.etcd_prefix.clone());
+        let coordinator = Coordinator::new(client, cfg.etcd.etcd_prefix.clone());
         let owned_targets = cfg.merge_rollout.owned_targets.clone();
         axum::Router::new()
             .route(
@@ -1977,13 +1940,7 @@ mod tests {
                 store.cleanup_own_shard().await.unwrap();
             }
         }
-        state
-            .registry
-            .write()
-            .await
-            .upsert(name, &uri)
-            .await
-            .unwrap();
+        state.registry.upsert(name, &uri).await.unwrap();
         crate::scanner::scan_once(&state).await.unwrap();
 
         // Saturate and over-fill the merge queue *before* the Compact.
@@ -2044,13 +2001,7 @@ mod tests {
                 store.cleanup_own_shard().await.unwrap();
             }
         }
-        state
-            .registry
-            .write()
-            .await
-            .upsert(name, &uri)
-            .await
-            .unwrap();
+        state.registry.upsert(name, &uri).await.unwrap();
         crate::scanner::scan_once(&state).await.unwrap();
 
         let compact = enqueue(&state, TaskKind::Compact, name).await.unwrap();

@@ -140,7 +140,6 @@ async fn run_legacy(state: &Arc<MasterState>, target: &str) -> Result<String, St
 
 struct Deadlines {
     queue: tokio::time::Instant,
-    execution_timeout: Duration,
     idle_timeout: Duration,
     running: Option<tokio::time::Instant>,
     last_progress: tokio::time::Instant,
@@ -151,7 +150,6 @@ impl Deadlines {
     fn new(execution: &Execution, now: tokio::time::Instant) -> Self {
         Self {
             queue: now + Duration::from_secs(execution.queue_timeout_secs) + RPC_TIMEOUT,
-            execution_timeout: Duration::from_secs(execution.timeout_secs),
             idle_timeout: Duration::from_secs(execution.idle_timeout_secs) + RPC_TIMEOUT,
             running: None,
             last_progress: now,
@@ -168,10 +166,7 @@ impl Deadlines {
     fn expired(&self, now: tokio::time::Instant) -> bool {
         match self.running {
             None => now >= self.queue,
-            Some(started) => {
-                now.duration_since(started) >= self.execution_timeout + RPC_TIMEOUT
-                    || now.duration_since(self.last_progress) >= self.idle_timeout
-            }
+            Some(_) => now.duration_since(self.last_progress) >= self.idle_timeout,
         }
     }
 }
@@ -434,9 +429,6 @@ async fn reconcile_with_grace(
     loop {
         // Losing etcd responses must not turn this into an unbounded scheduler
         // wait. Ownership remains durable when the reconciliation slot exits.
-        if cancel_started.is_none() && deadlines.expired(tokio::time::Instant::now()) {
-            cancel_started = Some(tokio::time::Instant::now());
-        }
         if cancel_started.is_some_and(|at| at.elapsed() >= grace) {
             let error = "merge ownership unresolved: executor did not acknowledge termination; fence retained pending storage version recovery";
             coordinator
@@ -448,6 +440,11 @@ async fn reconcile_with_grace(
             Ok(Some(current)) if current.id == initial.id => current,
             Ok(_) => return Err("merge execution ownership changed during reconciliation".into()),
             Err(error) => {
+                // Bound an unavailable coordinator independently. On successful
+                // reads, sample progress before evaluating the idle deadline.
+                if cancel_started.is_none() && deadlines.expired(tokio::time::Instant::now()) {
+                    cancel_started = Some(tokio::time::Instant::now());
+                }
                 tracing::warn!(target = %initial.target, %error, "cannot confirm merge completion; retaining execution fence");
                 tokio::time::sleep(RETRY_DELAY).await;
                 continue;
@@ -572,9 +569,9 @@ mod tests {
         let stalled = started + Duration::from_secs(1131);
         deadlines.observe(10, stalled);
         assert!(deadlines.expired(stalled));
-        // Even actual progress cannot extend the configured total ceiling.
+        // Real progress continues beyond the legacy total runtime ceiling.
         deadlines.observe(11, started + Duration::from_secs(1811));
-        assert!(deadlines.expired(started + Duration::from_secs(1811)));
+        assert!(!deadlines.expired(started + Duration::from_secs(1811)));
     }
 
     #[test]

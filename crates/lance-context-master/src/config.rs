@@ -10,6 +10,8 @@ pub struct MasterConfig {
     pub merge_rollout: lance_context_merge::rollout::MergeRollout,
     #[command(flatten)]
     pub maintenance: MaintenanceConfig,
+    #[command(flatten)]
+    pub catchup: crate::catchup::CatchupConfig,
     /// Data directory / object-store prefix shared with the data-plane server.
     #[arg(long, env = "DATA_DIR", default_value = "./data")]
     pub data_dir: String,
@@ -294,7 +296,7 @@ mod tests {
 /// Deadlines for local table mutations on explicitly owned targets.
 #[derive(Debug, Clone, clap::Args)]
 pub struct MaintenanceConfig {
-    /// Maximum local index/compact/repair execution time on owned targets.
+    /// Legacy wire field; owned work now uses the real-progress idle timeout.
     #[arg(long, env = "MAINTENANCE_TIMEOUT_SECS", default_value_t = 3600)]
     pub maintenance_timeout_secs: u64,
     /// Maximum time without a completed storage/processing step.

@@ -20,6 +20,7 @@ pub(crate) fn retry_kind(endpoint: &str) -> Option<TaskKind> {
         MaintenanceKind::Compact => Some(TaskKind::Compact),
         MaintenanceKind::IndexId => Some(TaskKind::IndexId),
         MaintenanceKind::Repair => Some(TaskKind::Repair),
+        MaintenanceKind::Catchup => Some(TaskKind::MergeWal),
     }
 }
 
@@ -154,7 +155,22 @@ where
         return work.await;
     }
     let maintenance = kind(claim.task.kind).ok_or("invalid local maintenance kind")?;
-    let uri = state.rollout_uri(&claim.task.target);
+    run_as(state, claim, maintenance, work).await
+}
+
+pub(crate) async fn run_as<F>(
+    state: &Arc<MasterState>,
+    claim: &TaskClaim,
+    maintenance: MaintenanceKind,
+    work: F,
+) -> Result<String, String>
+where
+    F: Future<Output = Result<String, String>>,
+{
+    let uri = match claim.task.target.strip_prefix("generic:") {
+        Some(name) => state.generic_uri(name),
+        None => state.rollout_uri(&claim.task.target),
+    };
     if !lance_context_core::merge_write_scope::supports_version_fencing(&uri) {
         return Err("invalid storage backend for maintenance fencing".into());
     }
@@ -175,7 +191,16 @@ where
     let mut reserved = Execution::new(
         &claim.task.target,
         maintenance.endpoint(),
-        &claim.task.id,
+        if maintenance == MaintenanceKind::Catchup {
+            state
+                .config
+                .catchup
+                .job_name
+                .as_deref()
+                .ok_or("missing catch-up Job identity")?
+        } else {
+            &claim.task.id
+        },
         config.maintenance_timeout_secs,
     );
     reserved.maintenance = Some(maintenance);
@@ -193,14 +218,13 @@ where
         uri,
     }));
     let outcome = std::panic::AssertUnwindSafe(async {
-        tokio::time::timeout(Duration::from_secs(running.timeout_secs), async {
+        let watched = async {
             tokio::select! {
                 result = scope.run(work) => result,
                 error = watch(&coordinator, &running, &scope) => Err(error),
             }
-        })
-        .await
-        .unwrap_or_else(|_| Err("maintenance execution deadline exceeded".into()))
+        };
+        watched.await
     })
     .catch_unwind()
     .await

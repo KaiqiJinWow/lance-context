@@ -782,6 +782,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_or_load_recovers_when_another_caller_wins() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().join("_registry.rollout.lance");
+        let uri = uri.to_str().unwrap();
+
+        // Force the check-then-create interleaving: both callers observe that
+        // the registry is absent before either one attempts to create it.
+        assert!(matches!(
+            RolloutRegistry::load(uri, None).await,
+            Err(LanceError::DatasetNotFound { .. })
+        ));
+        assert!(matches!(
+            RolloutRegistry::load(uri, None).await,
+            Err(LanceError::DatasetNotFound { .. })
+        ));
+
+        let winner = RolloutRegistry::create(uri, None).await.unwrap();
+        let mut winner = RolloutRegistry {
+            dataset: winner,
+            uri: uri.to_string(),
+            storage_options: None,
+        };
+        winner
+            .upsert("winner", "/data/winner.rollout.lance")
+            .await
+            .unwrap();
+
+        let loser = RolloutRegistry::create_or_load(uri, None).await.unwrap();
+
+        // In this late-loser interleaving, the caller reopens the winner's
+        // dataset instead of losing its rows or propagating DatasetAlreadyExists.
+        assert_eq!(loser.manifest.version, winner.dataset.manifest.version);
+        let mut loser = RolloutRegistry {
+            dataset: loser,
+            uri: uri.to_string(),
+            storage_options: None,
+        };
+        assert!(loser.contains("winner").await.unwrap());
+    }
+
+    #[tokio::test]
     async fn upsert_is_idempotent() {
         let dir = TempDir::new().unwrap();
         let mut reg = new_registry(&dir).await;

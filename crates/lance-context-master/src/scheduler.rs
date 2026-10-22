@@ -41,7 +41,7 @@ use crate::task_store::{TaskClaim, TaskKinds};
 /// task per row over the threshold, so at tens of thousands of experiments a
 /// single tick could flood the queue. Capping keeps each tick's work bounded;
 /// anything still over the threshold is picked up by the next tick.
-const MAX_SWEEP_ENQUEUE: usize = 256;
+pub(crate) const MAX_SWEEP_ENQUEUE: usize = 256;
 
 /// How many candidate rows a merge sweep reads per new task it may enqueue.
 /// Candidates already in flight are deduped and do not count against the cap.
@@ -213,7 +213,7 @@ async fn run_task(state: &Arc<MasterState>, mut claim: TaskClaim, timing: TaskCl
         }
     }
     let commit_start = std::time::Instant::now();
-    let finished = state.task_store.finish(claim, outcome).await;
+    let finished = finish_task(state, claim, outcome).await;
     metrics::histogram!("master_task_phase_duration_seconds", "kind" => kind, "phase" => "commit")
         .record(commit_start.elapsed().as_secs_f64());
     if let Err(error) = finished {
@@ -238,6 +238,37 @@ async fn run_task(state: &Arc<MasterState>, mut claim: TaskClaim, timing: TaskCl
         metrics::histogram!("master_compaction_phase_duration_seconds", "phase" => "stats_refresh")
             .record(started.elapsed().as_secs_f64());
     }
+}
+
+/// Publish completion before admitting any continuation for the same target.
+async fn finish_task(
+    state: &Arc<MasterState>,
+    claim: TaskClaim,
+    outcome: Result<String, String>,
+) -> lance::Result<()> {
+    let target = claim.task.target.clone();
+    let continue_resident = claim.task.kind == TaskKind::MergeWal
+        && outcome.is_ok()
+        && crate::local_merge::selected(&state.config, &target);
+    state.task_store.finish(claim, outcome).await?;
+    if continue_resident {
+        // The previous task and its write authority are durably released first.
+        // Retain ordinary queue fairness, dedupe and permits for the successor.
+        // Any failure here leaves durable demand for the periodic recovery scan;
+        // it must not turn a completed storage operation into a failed task.
+        let coordinator = state.task_store.merge_coordinator();
+        let result = async {
+            if let Some(request) = coordinator.get_merge_request(&target).await? {
+                enqueue_merge_request(state, &coordinator, &request).await?;
+            }
+            Ok::<_, String>(())
+        }
+        .await;
+        if let Err(error) = result {
+            tracing::warn!(%target, %error, "resident merge continuation enqueue deferred to recovery");
+        }
+    }
+    Ok(())
 }
 
 /// Whether a task error is the deterministic "manifest names a data file
@@ -932,7 +963,10 @@ async fn should_probe_failure(
     state: &Arc<MasterState>,
     failure: &lance_context_merge::failure::ShardFailure,
 ) -> bool {
-    if state.config.merge_rollout.owned(&failure.target) {
+    if !state.config.merge_rollout.draining(&failure.target)
+        && (state.config.merge_rollout.owned(&failure.target)
+            || state.config.merge_rollout.fence_legacy)
+    {
         return true;
     }
     if state.config.merge_rollout.draining(&failure.target) {
@@ -956,7 +990,13 @@ pub(crate) async fn enqueue_merge_request(
     coordinator: &lance_context_merge::Coordinator,
     request: &lance_context_merge::rollout::MergeRequest,
 ) -> Result<(), String> {
-    if !state.config.merge_rollout.owned(&request.target) {
+    if !state.config.merge_rollout.owned(&request.target)
+        && !state.config.merge_rollout.fence_legacy
+        && !coordinator
+            .get(&request.target)
+            .await?
+            .is_some_and(|e| e.maintenance.is_none())
+    {
         return Ok(());
     }
     let task = enqueue(state, TaskKind::MergeWal, &request.target)
@@ -965,6 +1005,23 @@ pub(crate) async fn enqueue_merge_request(
     if task.state == lance_context_api::TaskState::Queued {
         coordinator.acknowledge_request(request).await?;
     }
+    Ok(())
+}
+
+async fn enqueue_execution_recovery(
+    state: &Arc<MasterState>,
+    coordinator: &lance_context_merge::Coordinator,
+    execution: &lance_context_merge::Execution,
+) -> Result<(), String> {
+    if execution.maintenance.is_some() {
+        return crate::maintenance_execution::enqueue_recovery(state, coordinator, execution).await;
+    }
+    // Durable worker executions survive flags, endpoint list changes and loss
+    // of their coalesced request. Task claims still serialize reconciliation.
+    crate::merge_execution::ensure_recovery_due(coordinator, execution).await?;
+    enqueue(state, TaskKind::MergeWal, &execution.target)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -979,6 +1036,8 @@ pub(crate) async fn enqueue_merge_request(
 pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
     crate::wal_tail::spawn(state);
     crate::resident_recovery::spawn(state);
+    crate::planner::spawn(state);
+    crate::executors::spawn(state);
     // Retry metadata independently of coarse stats sweeps. Every replica may
     // enqueue; the existing task dedupe/claim transaction elects one executor.
     let retry_state = state.clone();
@@ -1010,15 +1069,8 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
                 Ok((executions, next)) => {
                     execution_cursor = next;
                     for execution in executions {
-                        if execution.maintenance.is_none() {
-                            continue;
-                        }
-                        if let Err(error) = crate::maintenance_execution::enqueue_recovery(
-                            &retry_state,
-                            &coordinator,
-                            &execution,
-                        )
-                        .await
+                        if let Err(error) =
+                            enqueue_execution_recovery(&retry_state, &coordinator, &execution).await
                         {
                             tracing::warn!(target = %execution.target, %error, "local execution recovery enqueue failed");
                         }
@@ -1102,7 +1154,8 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
     // WAL merge draws from its own budget so a backlog of slow HTTP fan-outs
     // cannot occupy every general slot and starve compaction. `0` opts back
     // into the shared pool.
-    let merge_sem = (state.config.merge_wal_concurrency > 0)
+    let claim_merges = state.config.maintenance.claim_wal_merges;
+    let merge_sem = (claim_merges && state.config.merge_wal_concurrency > 0)
         .then(|| Arc::new(Semaphore::new(state.config.merge_wal_concurrency)));
 
     // One poller per pool, each claiming only the kinds its pool runs.
@@ -1127,7 +1180,7 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
     let general = spawn_pool_poller(
         state.clone(),
         sem.clone(),
-        if merge_sem.is_some() {
+        if !claim_merges || merge_sem.is_some() {
             TaskKinds::GENERAL.without_compact()
         } else {
             // No separate merge budget: the general pool runs everything, so it
@@ -1140,7 +1193,8 @@ pub fn spawn_scheduler(state: &Arc<MasterState>) -> JoinHandle<()> {
     if let Some(merge) = merge_sem {
         spawn_pool_poller(state.clone(), merge, TaskKinds::MERGE_WAL, false);
     }
-    if state.config.append.rollout_append_local
+    if claim_merges
+        && crate::local_merge::enabled(&state.config)
         && state.config.append.rollout_append_local_task_concurrency > 0
     {
         // Reserve before claiming. A saturated legacy RPC pool cannot consume
@@ -1172,6 +1226,14 @@ fn spawn_pool_poller(
     spawn_filtered_pool_poller(state, pool, kinds, report_depth, false)
 }
 
+/// Decrements a gauge when dropped, so unwinding pays it back.
+struct GaugeHold(metrics::Gauge);
+impl Drop for GaugeHold {
+    fn drop(&mut self) {
+        self.0.decrement(1.0);
+    }
+}
+
 fn spawn_filtered_pool_poller(
     state: Arc<MasterState>,
     pool: Arc<Semaphore>,
@@ -1188,7 +1250,16 @@ fn spawn_filtered_pool_poller(
     } else {
         "general"
     };
-    let pool_total = pool.available_permits();
+    // Permits in use are split by what holds them: `claiming` while the etcd
+    // claim is outstanding, `running` once a task owns the permit. Both are
+    // updated at the permit boundaries themselves, so a claim that blocks on
+    // etcd for minutes shows as a held permit rather than as idle capacity.
+    let claiming =
+        metrics::gauge!("master_task_pool_in_use", "pool" => pool_label, "state" => "claiming");
+    let running =
+        metrics::gauge!("master_task_pool_in_use", "pool" => pool_label, "state" => "running");
+    claiming.set(0.0);
+    running.set(0.0);
     tokio::spawn(async move {
         loop {
             if report_depth {
@@ -1196,10 +1267,6 @@ fn spawn_filtered_pool_poller(
                     metrics::gauge!("master_task_queue_depth").set(queued as f64);
                 }
             }
-            // Every pool reports, including the resident-only slot added in
-            // #331 that the queue-depth gauge never covered.
-            metrics::gauge!("master_task_pool_in_use", "pool" => pool_label)
-                .set(pool_total.saturating_sub(pool.available_permits()) as f64);
             while pool.available_permits() > 0 {
                 // Reserve both budgets before taking durable table ownership.
                 let compact_permit = if kinds == TaskKinds::COMPACT {
@@ -1213,20 +1280,27 @@ fn spawn_filtered_pool_poller(
                 let Ok(permit) = pool.clone().try_acquire_owned() else {
                     break;
                 };
-                let Some(operation) = state.admission.try_admit() else {
+                let Some(operation) = state.admission.try_admit_named(pool_label) else {
                     break;
                 };
+                // Held across the await so a poller aborted mid-claim (drain,
+                // shutdown, test teardown) still pays the gauge back.
+                claiming.increment(1.0);
+                let claiming_hold = GaugeHold(claiming.clone());
+                operation.phase("claiming");
                 let claim_start = std::time::Instant::now();
                 let claim = if resident_only {
                     state
                         .task_store
-                        .claim_resident_merge(&state.config.append.rollout_append_targets)
+                        .claim_resident_merge(&crate::local_merge::targets(&state.config))
                         .await
                 } else {
                     state.task_store.claim_next_of_kinds(kinds).await
                 };
+                drop(claiming_hold);
                 match claim {
                     Ok(Some(claim)) => {
+                        operation.task(&claim.task.id, &claim.task.target);
                         let claim_elapsed = claim_start.elapsed();
                         // Local capacity was reserved before the claim. No
                         // claimed table waits on a compaction semaphore.
@@ -1235,9 +1309,18 @@ fn spawn_filtered_pool_poller(
                             permit_wait: Duration::ZERO,
                         };
                         let st = state.clone();
+                        let operation = Arc::new(operation);
+                        let capacity = crate::merge_capacity::Capacity::new(
+                            permit,
+                            pool.clone(),
+                            state.legacy_response_waiters.clone(),
+                            Duration::from_secs(state.config.legacy_merge_foreground_secs),
+                            running.clone(),
+                            operation.clone(),
+                        );
                         tokio::spawn(async move {
-                            run_task(&st, claim, timing).await;
-                            drop(permit);
+                            crate::merge_capacity::scope(capacity, run_task(&st, claim, timing))
+                                .await;
                             drop(compact_permit);
                             drop(operation);
                         });
@@ -1264,11 +1347,15 @@ mod tests {
 
     fn config(dir: &TempDir) -> MasterConfig {
         MasterConfig {
+            legacy_retirement_request: None,
+            local_merge: Default::default(),
             append: Default::default(),
             catchup: Default::default(),
             wal_tail: Default::default(),
+            planner: Default::default(),
             maintenance: Default::default(),
             merge_rollout: lance_context_merge::rollout::MergeRollout {
+                fence_legacy: false,
                 owned_targets: ["exp", "generic:gs", "broken"]
                     .into_iter()
                     .map(str::to_string)
@@ -1302,6 +1389,8 @@ mod tests {
             worker_endpoints: vec![],
             task_concurrency: 4,
             merge_wal_concurrency: 4,
+            legacy_merge_wait_concurrency: 32,
+            legacy_merge_foreground_secs: 30,
             task_cooldown_after_failures: 3,
             task_cooldown_base_secs: 600,
             task_cooldown_max_secs: 21_600,
@@ -1606,6 +1695,114 @@ mod tests {
         }
     }
 
+    /// The stats scan publishes a scan-sourced demand event for every shard
+    /// it observes, including shards whose writer never ran the server
+    /// flush path, and a later scan cannot lower a watermark a writer or
+    /// executor set at the same epoch.
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn scan_publishes_every_shard_and_never_lowers_a_watermark() {
+        use lance_context_core::RolloutStoreOptions;
+        use lance_context_merge::demand::{DemandEvent, EventSource, TableDemand};
+        let dir = TempDir::new().unwrap();
+        let cfg = config(&dir);
+        let state = MasterState::new(cfg).await.unwrap();
+        let uri = state.rollout_uri("exp");
+        for shard in ["a", "b"] {
+            let writer = RolloutStore::open_with_options(
+                &uri,
+                RolloutStoreOptions {
+                    shard_id: Some(shard.into()),
+                    merge_after_generations: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            for i in 0..3 {
+                writer
+                    .add(&[rollout_record(&format!("{shard}-{i}"))])
+                    .await
+                    .unwrap();
+                writer.flush().await.unwrap();
+            }
+        }
+        state.registry.upsert("exp", &uri).await.unwrap();
+        crate::scanner::scan_once(&state).await.unwrap();
+
+        let prefix = state
+            .config
+            .etcd
+            .etcd_prefix
+            .trim_end_matches('/')
+            .to_string();
+        let encoded: String = "exp".bytes().map(|b| format!("{b:02x}")).collect();
+        let events_prefix = format!("{prefix}/demand-events/{encoded}/");
+        let client = state.task_store.etcd_client().clone();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let events = loop {
+            let kvs = client
+                .clone()
+                .get(
+                    events_prefix.as_str(),
+                    Some(etcd_client::GetOptions::new().with_prefix()),
+                )
+                .await
+                .unwrap();
+            if kvs.kvs().len() >= 2 {
+                break kvs;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "scan demand never landed"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_eq!(events.kvs().len(), 2, "one scan event per shard");
+        let mut table = TableDemand::default();
+        for kv in events.kvs() {
+            let event: DemandEvent = serde_json::from_slice(kv.value()).unwrap();
+            assert_eq!(event.source, EventSource::Scan);
+            assert!(event.sealed_through >= 3, "{event:?}");
+            table.fold(&event, kv.mod_revision(), 0).unwrap();
+        }
+        assert_eq!(table.pending_generations(), 6);
+
+        // An executor reports merged=2 on shard "a" at the same epoch. A
+        // second scan (which knows nothing about merged) must not lower it.
+        let coordinator = state.task_store.merge_coordinator();
+        let (key, mut a): (String, DemandEvent) = events
+            .kvs()
+            .iter()
+            .map(|kv| {
+                (
+                    String::from_utf8_lossy(kv.key()).to_string(),
+                    serde_json::from_slice::<DemandEvent>(kv.value()).unwrap(),
+                )
+            })
+            .next()
+            .unwrap();
+        a.merged_through = Some(2);
+        a.source = EventSource::Executor;
+        assert!(coordinator.publish_demand_event("exp", &a).await.unwrap());
+        let before = client.clone().get(key.as_str(), None).await.unwrap().kvs()[0].mod_revision();
+        crate::scanner::scan_once(&state).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let after = client.clone().get(key.as_str(), None).await.unwrap();
+        let stored: DemandEvent = serde_json::from_slice(after.kvs()[0].value()).unwrap();
+        assert_eq!(
+            stored.merged_through,
+            Some(2),
+            "scan lowered merged: {stored:?}"
+        );
+        assert_eq!(stored.sealed_through, a.sealed_through);
+        assert_eq!(
+            after.kvs()[0].mod_revision(),
+            before,
+            "an unchanged scan must not rewrite the record"
+        );
+    }
+
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn compact_noop_survives_restart_and_changes_invalidate_it() {
@@ -1705,6 +1902,196 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn resident_completion_enqueues_durable_demand_without_periodic_scan() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.local_merge.master_local_merge_targets = vec!["exp".into()];
+        cfg.catchup.shards = vec!["writer".into()];
+        let state = MasterState::new(cfg).await.unwrap();
+        let coordinator = state.task_store.merge_coordinator();
+        let first = enqueue(&state, TaskKind::MergeWal, "exp").await.unwrap();
+        let claim = state.task_store.claim_next().await.unwrap().unwrap();
+        coordinator.request_merge("exp").await.unwrap();
+        finish_task(
+            &state,
+            claim,
+            Ok("local WAL merge reclaimed 2 generations".into()),
+        )
+        .await
+        .unwrap();
+        // No scheduler, scan, or explicit enqueue call runs after completion.
+        let next = state
+            .task_store
+            .get_active_id(TaskKind::MergeWal, "exp")
+            .await
+            .unwrap()
+            .expect("successful native pass must enqueue its durable continuation");
+        assert_ne!(first.id, next);
+        let successor = state.task_store.claim_next().await.unwrap().unwrap();
+        assert_eq!(successor.task.id, next);
+        assert!(coordinator.request_page(None).await.unwrap().0.is_empty());
+        // An empty pass with no new demand must not create a zero-work chain.
+        finish_task(
+            &state,
+            successor,
+            Ok("local WAL merge reclaimed 0 generations".into()),
+        )
+        .await
+        .unwrap();
+        assert!(state
+            .task_store
+            .get_active_id(TaskKind::MergeWal, "exp")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn resident_completion_does_not_fast_retry_failures_or_legacy_work() {
+        for resident in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let mut cfg = config(&dir);
+            if resident {
+                cfg.local_merge.master_local_merge_targets = vec!["exp".into()];
+                cfg.catchup.shards = vec!["writer".into()];
+            }
+            let state = MasterState::new(cfg).await.unwrap();
+            let coordinator = state.task_store.merge_coordinator();
+            enqueue(&state, TaskKind::MergeWal, "exp").await.unwrap();
+            let claim = state.task_store.claim_next().await.unwrap().unwrap();
+            coordinator.request_merge("exp").await.unwrap();
+            let outcome = if resident {
+                Err("injected merge failure".into())
+            } else {
+                Ok("legacy RPC succeeded".into())
+            };
+            finish_task(&state, claim, outcome).await.unwrap();
+            assert!(state
+                .task_store
+                .get_active_id(TaskKind::MergeWal, "exp")
+                .await
+                .unwrap()
+                .is_none());
+            assert!(coordinator
+                .get_merge_request("exp")
+                .await
+                .unwrap()
+                .is_some());
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn resident_completion_with_lost_claim_preserves_successor_and_demand() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.local_merge.master_local_merge_targets = vec!["exp".into()];
+        cfg.catchup.shards = vec!["writer".into()];
+        let state = MasterState::new(cfg).await.unwrap();
+        let coordinator = state.task_store.merge_coordinator();
+        let task = enqueue(&state, TaskKind::MergeWal, "exp").await.unwrap();
+        let old = state.task_store.claim_next().await.unwrap().unwrap();
+        coordinator.request_merge("exp").await.unwrap();
+        let demand = coordinator.get_merge_request("exp").await.unwrap().unwrap();
+        // Revoke this test's real etcd lease, then elect a replacement for the
+        // same canonical task before letting the stale executor report success.
+        let mut client = state.task_store.etcd_client().clone();
+        let key = format!("{}/claims/{}", state.config.etcd.prefix(), task.id);
+        let response = client.get(key, None).await.unwrap();
+        let lease = response.kvs().first().unwrap().lease();
+        assert_ne!(lease, 0);
+        client.lease_revoke(lease).await.unwrap();
+        // Normal admission recovers orphaned tasks before claiming.
+        let successor = state.task_store.claim_next().await.unwrap().unwrap();
+        assert_eq!(successor.task.id, task.id);
+        let error = finish_task(&state, old, Ok("stale success".into()))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("lost its etcd claim"), "{error}");
+        assert_eq!(
+            state
+                .task_store
+                .get_active_id(TaskKind::MergeWal, "exp")
+                .await
+                .unwrap(),
+            Some(task.id)
+        );
+        assert_eq!(
+            coordinator
+                .get_merge_request("exp")
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            demand.revision
+        );
+        state
+            .task_store
+            .finish(successor, Ok("replacement completed".into()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn resident_target_lookup_preserves_newer_demand_after_enqueue() {
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(config(&dir)).await.unwrap();
+        let coordinator = state.task_store.merge_coordinator();
+        coordinator.request_merge("exp-0").await.unwrap();
+        assert!(coordinator
+            .get_merge_request("exp")
+            .await
+            .unwrap()
+            .is_none());
+        coordinator.request_merge("exp").await.unwrap();
+        let before = coordinator.get_merge_request("exp").await.unwrap().unwrap();
+        coordinator.request_merge("exp").await.unwrap();
+        let after = coordinator.get_merge_request("exp").await.unwrap().unwrap();
+        assert!(after.revision > before.revision);
+        enqueue_merge_request(&state, &coordinator, &before)
+            .await
+            .unwrap();
+        assert_eq!(
+            coordinator
+                .get_merge_request("exp")
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            after.revision
+        );
+        assert!(coordinator
+            .get_merge_request("exp-0")
+            .await
+            .unwrap()
+            .is_some());
+        let first = state
+            .task_store
+            .get_active_id(TaskKind::MergeWal, "exp")
+            .await
+            .unwrap();
+        enqueue_merge_request(&state, &coordinator, &after)
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .task_store
+                .get_active_id(TaskKind::MergeWal, "exp")
+                .await
+                .unwrap(),
+            first
+        );
+        assert!(coordinator
+            .get_merge_request("exp")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn demand_during_running_merge_retains_a_followup_without_stats_sweep() {
         let dir = TempDir::new().unwrap();
         let mut cfg = config(&dir);
@@ -1738,6 +2125,104 @@ mod tests {
         assert!(coordinator.request_page(None).await.unwrap().0.is_empty());
     }
 
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn background_inventory_recovers_after_flags_and_requests_disappear() {
+        use lance_context_merge::Execution;
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.merge_rollout.owned_targets.clear();
+        cfg.merge_rollout.fence_legacy = false;
+        let state = MasterState::new(cfg).await.unwrap();
+        let c = state.task_store.merge_coordinator();
+        let mut e = Execution::new("new-hot-table", "http://127.0.0.1:1", "old-worker", 60);
+        e.background = true;
+        assert!(c.reserve_background(&e).await.unwrap());
+        let e = c.start(&e).await.unwrap().unwrap();
+        assert!(c.finish(&e, Ok(19)).await.unwrap());
+        let request = c.request_page(None).await.unwrap().0.remove(0);
+        assert!(c.acknowledge_request(&request).await.unwrap());
+        let inventory = c.execution_page(None).await.unwrap().0;
+        enqueue_execution_recovery(&state, &c, &inventory[0])
+            .await
+            .unwrap();
+        let claim = state
+            .task_store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let result = crate::merge_execution::run_merge_wal(&state, &claim)
+            .await
+            .unwrap();
+        assert!(result.contains("reconciled"));
+        assert!(c.get("new-hot-table").await.unwrap().is_none());
+        state.task_store.finish(claim, Ok(result)).await.unwrap();
+        // Ambiguous storage needs a real barrier after initiation is disabled.
+        let uri = state.rollout_uri("new-hot-table");
+        RolloutStore::open(&uri)
+            .await
+            .unwrap()
+            .close()
+            .await
+            .unwrap();
+        let version = lance::Dataset::open(&uri).await.unwrap().version().version;
+        let mut orphan = Execution::new("new-hot-table", "http://127.0.0.1:1", "lost-worker", 60);
+        orphan.background = true;
+        assert!(c.reserve_background(&orphan).await.unwrap());
+        let running = c.start(&orphan).await.unwrap().unwrap();
+        c.authorize_commit(&running, &uri, "base", version + 1)
+            .await
+            .unwrap();
+        assert!(c
+            .report_uncertain(&running, "lost response".into())
+            .await
+            .unwrap());
+        let old = c.get("new-hot-table").await.unwrap().unwrap();
+        enqueue_execution_recovery(&state, &c, &old).await.unwrap();
+        let claim = state
+            .task_store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let result = crate::merge_execution::run_merge_wal(&state, &claim)
+            .await
+            .unwrap();
+        assert!(c.get("new-hot-table").await.unwrap().is_none());
+        assert!(lance::Dataset::open(&uri).await.unwrap().version().version > version + 1);
+        assert!(c
+            .authorize_commit(&running, &uri, "base", version + 3)
+            .await
+            .is_err());
+        state.task_store.finish(claim, Ok(result)).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn fenced_new_table_demand_enqueues_without_static_ownership() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.merge_rollout.owned_targets.clear();
+        cfg.merge_rollout.fence_legacy = true;
+        let state = MasterState::new(cfg).await.unwrap();
+        let c = state.task_store.merge_coordinator();
+        c.request_merge("new-hot-table").await.unwrap();
+        let request = c.request_page(None).await.unwrap().0.remove(0);
+        enqueue_merge_request(&state, &c, &request).await.unwrap();
+        assert!(state
+            .task_store
+            .get_active_id(TaskKind::MergeWal, "new-hot-table")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(c.request_page(None).await.unwrap().0.is_empty());
+        assert!(
+            !crate::local_merge::selected(&state.config, "new-hot-table"),
+            "worker recording does not certify native ownership"
+        );
+    }
+
     /// Wait until the task reaches a terminal state, returning its final record.
     async fn await_terminal(state: &Arc<MasterState>, id: &str) -> TaskRecord {
         for _ in 0..100 {
@@ -1760,7 +2245,9 @@ mod tests {
         let mut cfg = config(&dir);
         cfg.merge_rollout.owned_targets.retain(|t| t != "exp");
         cfg.merge_rollout.drain_targets.push("exp".into());
-        cfg.worker_endpoints = vec!["http://127.0.0.1:1".into()];
+        // A resident-only master must reconcile the recorded old execution
+        // even though it has no configured worker endpoints for fresh work.
+        cfg.worker_endpoints.clear();
         let state = MasterState::new(cfg).await.unwrap();
         enqueue(&state, TaskKind::MergeWal, "exp").await.unwrap();
         let claim = state
@@ -2261,6 +2748,377 @@ mod tests {
             .is_some_and(|d| d.contains("prepared outside write lock")));
     }
 
+    /// Review rounds 5 and 7: sustained concurrent progress isolation.
+    /// Four real index preparations run at once for several idle timeouts:
+    /// two throttled-but-alive at different rates, one frozen from the
+    /// start, one frozen partway through. Each watchdog must judge only its
+    /// own scope's completed IO. The alive pair must finish regardless of
+    /// the frozen pair's silence; the frozen pair must be cancelled within
+    /// the idle window regardless of the alive pair's progress; and the
+    /// partway freeze must be detected from its own last progress, not the
+    /// test start. Runs long enough (> 4 idle windows) that a shared or
+    /// leaked progress counter would show up as a wrong verdict.
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS; ~20 s"]
+    async fn concurrent_preparations_are_judged_only_by_their_own_progress() {
+        use lance_context_core::merge_write_scope::MergeWriteScope;
+        use lance_context_core::preparation_io::test_support::{Throttle, ThrottleWrapper};
+        use std::sync::atomic::Ordering;
+        const IDLE: u64 = 3;
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.data_dir = format!("file-object-store://{}", dir.path().display());
+        cfg.maintenance.index_prepare_targets = vec!["*".into()];
+        cfg.maintenance.maintenance_idle_timeout_secs = IDLE;
+        cfg.merge_rollout.owned_targets = ["slow-a", "slow-b", "frozen-start", "frozen-mid"]
+            .map(String::from)
+            .to_vec();
+        cfg.task_concurrency = 4;
+        let state = MasterState::new(cfg).await.unwrap();
+        for target in ["slow-a", "slow-b", "frozen-start", "frozen-mid"] {
+            let mut writer = RolloutStore::open(&state.rollout_uri(target))
+                .await
+                .unwrap();
+            let records: Vec<_> = (0..64)
+                .map(|i| rollout_record(&format!("{target}-{i}")))
+                .collect();
+            writer.add(&records).await.unwrap();
+            writer.cleanup_own_shard().await.unwrap();
+        }
+        let mut claims = std::collections::HashMap::new();
+        for _ in 0..4 {
+            let claim = state
+                .task_store
+                .claim_next_of_kinds(TaskKinds::GENERAL.without_compact())
+                .await
+                .unwrap();
+            let claim = match claim {
+                Some(c) => c,
+                None => {
+                    // Enqueue lazily so claims come out one per table.
+                    for target in ["slow-a", "slow-b", "frozen-start", "frozen-mid"] {
+                        if !claims.contains_key(target) {
+                            enqueue(&state, TaskKind::IndexId, target).await.unwrap();
+                        }
+                    }
+                    state
+                        .task_store
+                        .claim_next_of_kinds(TaskKinds::GENERAL.without_compact())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                }
+            };
+            assert!(claim.preparing_maintenance());
+            claims.insert(claim.task.target.clone(), claim);
+        }
+        assert_eq!(claims.len(), 4);
+
+        let run =
+            |target: &'static str, claim: crate::task_store::TaskClaim, throttle: Throttle| {
+                let state = state.clone();
+                let scope = MergeWriteScope::with_preparation_authorizer_and_io_shim(
+                    Arc::new(PreparationOnly),
+                    Arc::new(ThrottleWrapper(throttle.clone())),
+                );
+                let uri = state.rollout_uri(target);
+                async move {
+                    let began = std::time::Instant::now();
+                    let work = scope.run(async {
+                        let store = RolloutStore::open_existing_with_options(
+                            &uri,
+                            state.rollout_store_options(),
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?;
+                        store
+                            .prepare_id_key_index()
+                            .await
+                            .map(|_| "prepared")
+                            .map_err(|e| e.to_string())
+                    });
+                    let outcome = tokio::select! {
+                        done = work => done,
+                        error = watch_maintenance_preparation(&state, &claim, &scope) => Err(error),
+                    };
+                    (
+                        outcome,
+                        began.elapsed(),
+                        throttle.ops.load(Ordering::Relaxed),
+                        claim,
+                    )
+                }
+            };
+        let slow_a = Throttle::new(Duration::from_millis(1200)); // 2.5x per op below IDLE
+        let slow_b = Throttle::new(Duration::from_millis(2500)); // just under IDLE per op
+        let frozen_start = Throttle::new(Duration::ZERO);
+        frozen_start.frozen.store(true, Ordering::Relaxed);
+        // Slow enough that the build is still mid-flight when frozen: at
+        // 1.2 s/op a 64-row build runs well past 2 x IDLE.
+        let frozen_mid = Throttle::new(Duration::from_millis(1200));
+        let freezer = {
+            let f = frozen_mid.clone();
+            tokio::spawn(async move {
+                // Let it make real progress for ~1.5 idle windows, then stop.
+                tokio::time::sleep(Duration::from_millis(IDLE * 1500)).await;
+                f.frozen.store(true, Ordering::Relaxed);
+                std::time::Instant::now()
+            })
+        };
+        let started = std::time::Instant::now();
+        let c_a = claims.remove("slow-a").unwrap();
+        let c_b = claims.remove("slow-b").unwrap();
+        let c_fs = claims.remove("frozen-start").unwrap();
+        let c_fm = claims.remove("frozen-mid").unwrap();
+        // A frozen build that is never cancelled would hang here; bound the
+        // whole scenario so a regression fails fast instead.
+        let (a, b, fs, fm) = tokio::time::timeout(Duration::from_secs(60), async {
+            tokio::join!(
+                run("slow-a", c_a, slow_a.clone()),
+                run("slow-b", c_b, slow_b.clone()),
+                run("frozen-start", c_fs, frozen_start.clone()),
+                run("frozen-mid", c_fm, frozen_mid.clone()),
+            )
+        })
+        .await
+        .expect("a frozen preparation was never cancelled: watchdogs are not isolated");
+        let froze_at = freezer.await.unwrap();
+        let idle = Duration::from_secs(IDLE);
+
+        // Alive pair: finished, each past the idle window, with real IO.
+        for (name, (outcome, elapsed, ops, _)) in [("slow-a", &a), ("slow-b", &b)] {
+            assert_eq!(
+                *outcome,
+                Ok("prepared"),
+                "{name} was cancelled: {outcome:?}"
+            );
+            assert!(
+                *elapsed > idle,
+                "{name} finished in {elapsed:?}, inside one idle window; vacuous"
+            );
+            assert!(*ops >= 3, "{name} saw {ops} ops; shim not intercepting");
+        }
+        assert!(
+            b.1 > a.1,
+            "the slower build must take longer (a={:?}, b={:?}); else rates are not real",
+            a.1,
+            b.1
+        );
+        // Frozen from the start: cancelled in [IDLE, IDLE+4) from test start.
+        assert_eq!(
+            fs.0,
+            Err("maintenance preparation made no progress".to_string())
+        );
+        assert!(
+            fs.1 >= idle && fs.1 < idle + Duration::from_secs(4),
+            "frozen-start at {:?}",
+            fs.1
+        );
+        // Frozen midway: cancelled in [IDLE, IDLE+4) from *its own* freeze,
+        // not from the start and not from a neighbour's progress.
+        assert_eq!(
+            fm.0,
+            Err("maintenance preparation made no progress".to_string())
+        );
+        let since_freeze = (started + fm.1).saturating_duration_since(froze_at);
+        assert!(
+            since_freeze >= idle - Duration::from_millis(500)
+                && since_freeze < idle + Duration::from_secs(4),
+            "frozen-mid cancelled {since_freeze:?} after its freeze (total {:?})",
+            fm.1
+        );
+        assert!(
+            fm.2 >= 2,
+            "frozen-mid should have made progress before freezing: {} ops",
+            fm.2
+        );
+        // And the alive builds outlived both cancellations.
+        assert!(
+            a.1 > fs.1 && b.1 > fs.1,
+            "alive builds ended before the frozen one was cancelled"
+        );
+        for (claim, ok) in [(a.3, true), (b.3, true), (fs.3, false), (fm.3, false)] {
+            let result = if ok {
+                Ok("prepared".to_string())
+            } else {
+                Err("stalled".to_string())
+            };
+            state.task_store.finish(claim, result).await.unwrap();
+        }
+    }
+
+    /// Review finding 6 on #340: prove the watchdog on a *real* index build
+    /// with real storage behaviour, not hand-placed checkpoints.
+    ///
+    /// (a) Throttled IO: every data/index operation sleeps longer than the
+    ///     idle timeout would allow between manual checkpoints, yet because
+    ///     each completed operation is progress, the build runs past the idle
+    ///     timeout and finishes.
+    /// (b) Frozen IO: the same build with storage parked part-way is cancelled
+    ///     by the watchdog with the stall error, within [IDLE, IDLE + 4).
+    /// (c) Isolation: a second, healthy preparation on another table running
+    ///     concurrently with (b) is not cancelled and does not keep (b) alive.
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn real_index_build_survives_slow_io_and_is_cancelled_when_frozen() {
+        use lance_context_core::merge_write_scope::MergeWriteScope;
+        use lance_context_core::preparation_io::test_support::{Throttle, ThrottleWrapper};
+        const IDLE: u64 = 3;
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        // Plain local paths take Lance's direct file IO and bypass object-store
+        // wrappers; progress there comes from the io_tracker. The
+        // `file-object-store` scheme drives the same directory through the
+        // ObjectStore API, so the shim and the progress wrapper see every
+        // data/index operation exactly as they would on a cloud store, which
+        // is the path this test is about.
+        cfg.data_dir = format!("file-object-store://{}", dir.path().display());
+        cfg.maintenance.index_prepare_targets = vec!["*".into()];
+        cfg.maintenance.maintenance_idle_timeout_secs = IDLE;
+        cfg.merge_rollout.owned_targets = vec!["slow".into(), "frozen".into(), "healthy".into()];
+        let state = MasterState::new(cfg).await.unwrap();
+        // Enough rows to force several data-file operations during the build.
+        for target in ["slow", "frozen", "healthy"] {
+            let mut writer = RolloutStore::open(&state.rollout_uri(target))
+                .await
+                .unwrap();
+            let records: Vec<_> = (0..64)
+                .map(|i| rollout_record(&format!("{target}-{i}")))
+                .collect();
+            writer.add(&records).await.unwrap();
+            writer.cleanup_own_shard().await.unwrap();
+        }
+        let claim_for = |state: Arc<MasterState>, target: &'static str| async move {
+            enqueue(&state, TaskKind::IndexId, target).await.unwrap();
+            let claim = state
+                .task_store
+                .claim_next_of_kinds(TaskKinds::GENERAL.without_compact())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(claim.task.target, target);
+            assert!(claim.preparing_maintenance());
+            claim
+        };
+        let prepare =
+            |state: Arc<MasterState>, scope: Arc<MergeWriteScope>, target: &'static str| {
+                let uri = state.rollout_uri(target);
+                async move {
+                    scope
+                        .run(async {
+                            let store = RolloutStore::open_existing_with_options(
+                                &uri,
+                                state.rollout_store_options(),
+                            )
+                            .await
+                            .map_err(|e| e.to_string())?;
+                            store
+                                .prepare_id_key_index()
+                                .await
+                                .map(|_| "prepared")
+                                .map_err(|e| e.to_string())
+                        })
+                        .await
+                }
+            };
+
+        // (a) Throttled: 1.2 s per data-file op, idle timeout 3 s. The build
+        // must take longer than IDLE in total and still complete.
+        let claim = claim_for(state.clone(), "slow").await;
+        let throttle = Throttle::new(Duration::from_millis(1200));
+        let scope = MergeWriteScope::with_preparation_authorizer_and_io_shim(
+            Arc::new(PreparationOnly),
+            Arc::new(ThrottleWrapper(throttle.clone())),
+        );
+        let began = std::time::Instant::now();
+        let outcome = tokio::select! {
+            done = prepare(state.clone(), scope.clone(), "slow") => done,
+            error = watch_maintenance_preparation(&state, &claim, &scope) => Err(error),
+        };
+        let elapsed = began.elapsed();
+        let ops = throttle.ops.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            ops >= 3,
+            "shim did not intercept data IO (ops={ops}); test is vacuous"
+        );
+        assert_eq!(
+            outcome,
+            Ok("prepared"),
+            "slow-but-alive real build was cancelled"
+        );
+        assert!(
+            elapsed > Duration::from_secs(IDLE),
+            "build finished in {elapsed:?}; did not outlive the idle timeout, test is vacuous"
+        );
+        state
+            .task_store
+            .finish(claim, Ok("a".into()))
+            .await
+            .unwrap();
+
+        // (b) + (c): freeze "frozen" after its first data op; run "healthy"
+        // concurrently with no throttle. Only "frozen" is cancelled.
+        let frozen_claim = claim_for(state.clone(), "frozen").await;
+        let healthy_claim = claim_for(state.clone(), "healthy").await;
+        let throttle = Throttle::new(Duration::ZERO);
+        throttle
+            .frozen
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let frozen_scope = MergeWriteScope::with_preparation_authorizer_and_io_shim(
+            Arc::new(PreparationOnly),
+            Arc::new(ThrottleWrapper(throttle.clone())),
+        );
+        let healthy_scope = MergeWriteScope::with_preparation_authorizer(Arc::new(PreparationOnly));
+        let began = std::time::Instant::now();
+        let frozen_run = async {
+            tokio::select! {
+                done = prepare(state.clone(), frozen_scope.clone(), "frozen") => done,
+                error = watch_maintenance_preparation(&state, &frozen_claim, &frozen_scope) => Err(error),
+            }
+        };
+        let healthy_run = async {
+            // Give the healthy build a slow start so it overlaps the frozen
+            // one's stall window rather than finishing instantly.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::select! {
+                done = prepare(state.clone(), healthy_scope.clone(), "healthy") => done,
+                error = watch_maintenance_preparation(&state, &healthy_claim, &healthy_scope) => Err(error),
+            }
+        };
+        let (frozen_outcome, healthy_outcome) = tokio::join!(frozen_run, healthy_run);
+        let elapsed = began.elapsed();
+        assert_eq!(
+            frozen_outcome,
+            Err("maintenance preparation made no progress".to_string())
+        );
+        assert!(
+            elapsed >= Duration::from_secs(IDLE) && elapsed < Duration::from_secs(IDLE + 4),
+            "frozen build cancelled after {elapsed:?}"
+        );
+        assert_eq!(
+            healthy_outcome,
+            Ok("prepared"),
+            "healthy build was collateral damage"
+        );
+        assert!(
+            throttle.ops.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "frozen shim never saw IO; test is vacuous"
+        );
+        throttle
+            .frozen
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        state
+            .task_store
+            .finish(frozen_claim, Err("stalled".into()))
+            .await
+            .unwrap();
+        state
+            .task_store
+            .finish(healthy_claim, Ok("h".into()))
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn prepared_index_task_runs_with_fenced_publication() {
@@ -2410,6 +3268,126 @@ mod tests {
         assert_eq!(state.task_store.list().await.unwrap().len(), 1);
     }
 
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn wal_claim_targets_apply_to_shared_merge_and_resident_pools() {
+        for (merge_concurrency, resident) in [(0, false), (2, false), (2, true)] {
+            let dir = TempDir::new().unwrap();
+            let mut cfg = config(&dir);
+            cfg.maintenance.wal_claim_targets = vec!["hot".into()];
+            cfg.merge_wal_concurrency = merge_concurrency;
+            if resident {
+                cfg.local_merge.master_local_merge_targets = vec!["excluded".into()];
+                cfg.merge_rollout.owned_targets = vec!["excluded".into()];
+                cfg.catchup.shards = vec!["writer".into()];
+                cfg.catchup.slice_secs = 2;
+                cfg.catchup.merge_max_bytes = 1024 * 1024;
+            }
+            let mut peer_cfg = cfg.clone();
+            peer_cfg.maintenance.wal_claim_targets.clear();
+            let state = MasterState::new(cfg).await.unwrap();
+            let mut store = RolloutStore::open(&state.rollout_uri("outside"))
+                .await
+                .unwrap();
+            store.add(&[rollout_record("row")]).await.unwrap();
+            store.cleanup_own_shard().await.unwrap();
+            let excluded = enqueue(&state, TaskKind::MergeWal, "excluded")
+                .await
+                .unwrap();
+            let hot = enqueue(&state, TaskKind::MergeWal, "hot").await.unwrap();
+            let compact = enqueue(&state, TaskKind::Compact, "outside").await.unwrap();
+            let scheduler = spawn_scheduler(&state);
+            let selected = await_terminal(&state, &hot.id).await;
+            assert_eq!(selected.state, TaskState::Failed);
+            assert!(selected.error.unwrap().contains("worker endpoints"));
+            assert_eq!(
+                await_terminal(&state, &compact.id).await.state,
+                TaskState::Done
+            );
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            state.admission.begin_drain();
+            tokio::time::timeout(Duration::from_secs(10), state.admission.wait_drained())
+                .await
+                .unwrap();
+            scheduler.abort();
+            let queued = state.task_store.get(&excluded.id).await.unwrap().unwrap();
+            assert_eq!(queued.state, TaskState::Queued);
+            assert!(queued.started_at.is_none());
+            let peer = crate::task_store::TaskStore::open(&peer_cfg).await.unwrap();
+            let claim = peer
+                .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(claim.task.id, excluded.id);
+            peer.finish(claim, Ok("peer accepted".into()))
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Maintenance-only masters leave merge tasks available to their peers.
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn disabled_merge_claims_preserve_maintenance_and_other_executor_admission() {
+        // Cover the general-pool fallback, dedicated RPC pool and resident
+        // pool. A zero concurrency budget alone used to claim MergeWal too.
+        for (merge_concurrency, resident) in [(0, false), (2, false), (2, true)] {
+            let dir = TempDir::new().unwrap();
+            let mut cfg = config(&dir);
+            cfg.maintenance.claim_wal_merges = false;
+            cfg.merge_wal_concurrency = merge_concurrency;
+            if resident {
+                cfg.local_merge.master_local_merge_targets = vec!["exp".into()];
+                cfg.catchup.shards = vec!["writer".into()];
+                cfg.catchup.slice_secs = 2;
+                cfg.catchup.merge_max_bytes = 1024 * 1024;
+            }
+            let state = MasterState::new(cfg).await.unwrap();
+            for name in ["exp", "other"] {
+                let mut store = RolloutStore::open(&state.rollout_uri(name)).await.unwrap();
+                store.add(&[rollout_record("row")]).await.unwrap();
+                store.cleanup_own_shard().await.unwrap();
+            }
+            let merge = enqueue(&state, TaskKind::MergeWal, "exp").await.unwrap();
+            let compact = enqueue(&state, TaskKind::Compact, "exp").await.unwrap();
+            let index = enqueue(&state, TaskKind::IndexId, "other").await.unwrap();
+            let scheduler = spawn_scheduler(&state);
+            for task in [&compact, &index] {
+                let terminal = await_terminal(&state, &task.id).await;
+                assert_eq!(terminal.state, TaskState::Done, "{terminal:?}");
+            }
+            // Observe more than one poll interval, then close admission and
+            // join admitted work before checking the durable claim state.
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            state.admission.begin_drain();
+            tokio::time::timeout(Duration::from_secs(10), state.admission.wait_drained())
+                .await
+                .unwrap();
+            scheduler.abort();
+            let queued = state.task_store.get(&merge.id).await.unwrap().unwrap();
+            assert_eq!(queued.state, TaskState::Queued, "{queued:?}");
+            assert!(
+                queued.started_at.is_none(),
+                "disabled executor claimed merge"
+            );
+            // The task and its target remain available to an enabled peer;
+            // the setting is local dispatch policy, not a global queue pause.
+            let peer = state
+                .task_store
+                .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(peer.task.id, merge.id);
+            state
+                .task_store
+                .finish(peer, Ok("peer accepted".into()))
+                .await
+                .unwrap();
+        }
+    }
+
     /// A MergeWal task with no configured endpoints fails fast with a clear msg.
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
@@ -2422,6 +3400,13 @@ mod tests {
         assert_eq!(status.state, TaskState::Failed);
         assert!(status.error.unwrap().contains("worker endpoints"));
         worker.abort();
+    }
+
+    fn legacy_stub(app: axum::Router) -> axum::Router {
+        app.route("/api/v1/internal/merge-executor", axum::routing::get(|| async {
+            axum::Json(serde_json::json!({"protocol":2,"instance":"legacy","timeout_secs":600,
+                "queue_timeout_secs":600,"idle_timeout_secs":600,"progress_protocol":1,"owned_targets":[]}))
+        }))
     }
 
     /// Wrap test workers in the production ownership wire protocol, preserving
@@ -2489,6 +3474,121 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn legacy_response_wait_preserves_dependencies_and_frees_the_only_slot() {
+        use axum::{extract::Path, routing::post, Json, Router};
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        assert!(
+            endpoint.starts_with("http://127.0.0.1:") || endpoint.starts_with("http://localhost:")
+        );
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let app = Router::new().route(
+            "/api/v1/internal/merge-wal/{name}",
+            post({
+                let started = started.clone();
+                let release = release.clone();
+                move |Path(name): Path<String>| {
+                    let started = started.clone();
+                    let release = release.clone();
+                    async move {
+                        if name == "slow" {
+                            started.notify_one();
+                            release.notified().await;
+                        }
+                        Json(serde_json::json!({"reclaimed": 3}))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.merge_rollout.owned_targets.clear();
+        cfg.merge_wal_concurrency = 1;
+        cfg.legacy_merge_foreground_secs = 1;
+        cfg.legacy_merge_wait_concurrency = 2;
+        cfg.worker_endpoints = vec![format!("http://{}", listener.local_addr().unwrap())];
+        let app = legacy_stub(app);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = MasterState::new(cfg).await.unwrap();
+        let slow = enqueue(&state, TaskKind::MergeWal, "slow").await.unwrap();
+        let pool = Arc::new(Semaphore::new(1));
+        let poller = spawn_pool_poller(state.clone(), pool.clone(), TaskKinds::MERGE_WAL, false);
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .unwrap();
+        let dependent = enqueue_with_deps(
+            &state,
+            TaskKind::MergeWal,
+            "dependent",
+            vec![slow.id.clone()],
+        )
+        .await
+        .unwrap();
+        let fast = enqueue(&state, TaskKind::MergeWal, "fast").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if state.task_store.get(&fast.id).await.unwrap().unwrap().state == TaskState::Done {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("another table must complete before the slow response is released");
+        let coordinator = state.task_store.merge_coordinator();
+        assert_eq!(
+            coordinator.get("slow").await.unwrap().unwrap().phase,
+            lance_context_merge::Phase::Running
+        );
+        assert_eq!(
+            state.task_store.get(&slow.id).await.unwrap().unwrap().state,
+            TaskState::Running
+        );
+        assert_eq!(
+            state
+                .task_store
+                .get(&dependent.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            TaskState::Queued
+        );
+        assert!(state.admission.status().active_operations > 0);
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while state
+                .task_store
+                .get(&dependent.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state
+                != TaskState::Done
+            {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("dependent work must wait for, and then follow, the original merge task");
+        assert_eq!(
+            state.task_store.get(&slow.id).await.unwrap().unwrap().state,
+            TaskState::Done
+        );
+        assert!(coordinator.get("slow").await.unwrap().is_none());
+        state.admission.begin_drain();
+        tokio::time::timeout(Duration::from_secs(5), state.admission.wait_drained())
+            .await
+            .unwrap();
+        assert_eq!(pool.available_permits(), 1);
+        poller.abort();
+        let _ = poller.await;
+        server.abort();
+    }
+
+    #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn executor_drain_finishes_current_merge_and_leaves_queue_for_other_master() {
         use axum::{routing::post, Json, Router};
@@ -2548,6 +3648,16 @@ mod tests {
         let draining = state.admission.status();
         assert!(!draining.accepting);
         assert!(draining.active_operations > 0);
+        assert_eq!(draining.active_operations, draining.operations.len());
+        let admitted = draining
+            .operations
+            .values()
+            .find(|operation| operation.task_id.as_deref() == Some(current.id.as_str()))
+            .expect("running merge must identify its durable task");
+        assert_eq!(admitted.target.as_deref(), Some("exp"));
+        assert_eq!(admitted.kind, "merge");
+        assert_eq!(admitted.phase, "running");
+        assert!(admitted.progress.is_none(), "no fabricated merge progress");
         let next = enqueue(&state, TaskKind::MergeWal, "exp-1").await.unwrap();
         release.add_permits(2);
         tokio::time::timeout(Duration::from_secs(10), state.admission.wait_drained())
@@ -2613,6 +3723,7 @@ mod tests {
         cfg.catchup.shards = vec!["writer".into()];
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         cfg.worker_endpoints = vec![format!("http://{}", listener.local_addr().unwrap())];
+        let app = legacy_stub(app);
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let state = MasterState::new(cfg).await.unwrap();
         let writer = RolloutStore::open_with_options(

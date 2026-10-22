@@ -4,9 +4,12 @@
 //! Only the executor can publish its terminal outcome. Recovery first cancels
 //! and reconciles the old execution; it never clears a running fence on timeout.
 
+pub mod background;
 pub mod demand;
 pub mod failure;
 pub mod fencing;
+pub mod legacy_retirement;
+mod mode;
 pub mod progress;
 pub mod rollout;
 
@@ -66,6 +69,10 @@ impl MaintenanceKind {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Execution {
+    /// Count/timer-triggered worker execution, admitted without a scheduler
+    /// claim. Its persistent owner and commit permits are otherwise identical.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub background: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maintenance: Option<MaintenanceKind>,
     pub id: String,
@@ -88,6 +95,10 @@ fn protocol_absent(protocol: &u32) -> bool {
     *protocol == 0
 }
 
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
 fn default_queue_timeout() -> u64 {
     600
 }
@@ -95,6 +106,7 @@ fn default_queue_timeout() -> u64 {
 impl Execution {
     pub fn new(target: &str, endpoint: &str, instance: &str, timeout_secs: u64) -> Self {
         Self {
+            background: false,
             maintenance: None,
             id: uuid::Uuid::new_v4().to_string(),
             target: target.into(),
@@ -220,11 +232,37 @@ impl Coordinator {
     /// Atomic claim check and admission close the delayed-request/lease-loss race.
     pub async fn reserve(&self, claim: &ClaimProof, execution: &Execution) -> Result<bool> {
         if execution.phase != Phase::Reserved
+            || execution.background
             || execution.timeout_secs == 0
             || execution.protocol != 2
         {
             return Err("invalid merge execution reservation".into());
         }
+        self.reserve_record(claim, execution).await
+    }
+
+    /// Record an unfenced HTTP execution BEFORE sending its request. Protocol 0
+    /// cannot be recovered using protocol 2 storage barriers. Running is
+    /// deliberate: a legacy worker cannot CAS Reserved -> Running, so even a
+    /// crash before send must conservatively retain ownership.
+    pub async fn admit_legacy(
+        &self,
+        claim: &ClaimProof,
+        target: &str,
+        endpoint: &str,
+    ) -> Result<Execution> {
+        let mut execution = Execution::new(target, endpoint, "legacy-http", 1);
+        execution.protocol = 0;
+        execution.phase = Phase::Running;
+        if !self.reserve_record(claim, &execution).await? {
+            return Err(
+                "claim lost or execution already present before legacy merge admission".into(),
+            );
+        }
+        Ok(execution)
+    }
+
+    async fn reserve_record(&self, claim: &ClaimProof, execution: &Execution) -> Result<bool> {
         let key = execution_key(&self.prefix, &execution.target);
         self.transact(
             vec![
@@ -327,7 +365,11 @@ impl Coordinator {
         .await
     }
 
-    async fn transact(&self, compares: Vec<Compare>, operations: Vec<TxnOp>) -> Result<bool> {
+    pub(crate) async fn transact(
+        &self,
+        compares: Vec<Compare>,
+        operations: Vec<TxnOp>,
+    ) -> Result<bool> {
         self.client
             .clone()
             .txn(Txn::new().when(compares).and_then(operations))

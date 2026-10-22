@@ -81,6 +81,10 @@ pub(crate) const DEFAULT_MANIFEST_SCAN_BATCH_SIZE: usize = 16;
 /// concurrently while collecting observability metrics.
 pub(crate) const DEFAULT_OBSERVE_CONCURRENCY: usize = 16;
 
+// Cold WAL replay decodes payloads. Serialize maintenance-triggered recovery
+// across tables rather than opening a writer for every cold store at once.
+static OWN_WAL_RECOVERY_SLOT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
 /// Flushed generations folded into the base table by one merge pass, by default.
 ///
 /// A merge buffers every row of every generation it takes before appending, and
@@ -224,6 +228,10 @@ pub struct ShardWatermark {
     pub sealed_through: u64,
     /// Flushed generations not yet merged into the base table.
     pub pending_generations: usize,
+    /// Highest generation the base table's MemWAL index records as merged
+    /// for this shard, when the caller read the base index. `None` means
+    /// "not read", not "nothing merged".
+    pub merged_through: Option<u64>,
 }
 
 pub fn is_pending_generations_exceeded(err: &LanceError) -> bool {
@@ -395,6 +403,8 @@ pub(crate) struct StorageBase {
     pending_generations_max: usize,
     /// Process-wide merge byte budget; `None` means unbounded.
     merge_budget: Option<Arc<MergeMemoryBudget>>,
+    /// Serializes split preparation/commit on this handle, before taking a store lock.
+    merge_preparation_gate: Arc<tokio::sync::Mutex<()>>,
     /// Timestamp of the last successful [`Self::compact`] on this handle.
     last_compaction: Option<DateTime<Utc>>,
     /// Number of successful compactions performed by this handle.
@@ -548,6 +558,7 @@ impl StorageBase {
             pending_generations_max: pending_generations_max
                 .unwrap_or(DEFAULT_PENDING_GENERATIONS_MAX),
             merge_budget,
+            merge_preparation_gate: Arc::new(tokio::sync::Mutex::new(())),
             last_compaction: None,
             total_compactions: 0,
             last_compaction_error: None,
@@ -743,21 +754,65 @@ impl StorageBase {
         // magnitude, and `noop` is by far the most common, so a blended histogram
         // would be dominated by near-zero samples. Failures are counted, not timed.
         match &result {
-            Ok(outcome) => {
-                let label = match outcome {
-                    FlushOutcome::Sealed => "sealed",
-                    FlushOutcome::Noop => "noop",
-                    FlushOutcome::Fenced => "fenced",
-                };
+            Ok(_outcome) => {
                 observe_duration!(
                     crate::metrics::ROLLOUT_FLUSH_DURATION,
                     timer_elapsed!(started),
-                    "outcome" => label,
+                    "outcome" => match _outcome {
+                        FlushOutcome::Sealed => "sealed",
+                        FlushOutcome::Noop => "noop",
+                        FlushOutcome::Fenced => "fenced",
+                    },
                 );
             }
             Err(_) => count!(crate::metrics::ROLLOUT_FLUSH_ERRORS),
         }
         result.map(|_| ())
+    }
+
+    /// Recover a restarted instance's durable WAL before its cleanup merge.
+    /// Ordinary flush sweeps stay cheap: they only touch resident writers.
+    /// This path is for this handle's OWN write shard, never a foreign shard;
+    /// as with `put`, the caller must have exclusive ownership of that writer ID.
+    /// Opening a writer claims its epoch, so this is not a mechanism for taking
+    /// over an instance that is still alive.
+    /// Returns false when there is no own shard to merge.
+    async fn recover_and_flush_own_wal(&self) -> LanceResult<bool> {
+        if self.is_version_pinned() || self.deleted {
+            return Ok(false);
+        }
+        if self.write_writer.lock().await.is_some() {
+            self.flush().await?;
+            return Ok(true);
+        }
+        let manifest_store = ShardManifestStore::new(
+            self.dataset.object_store(None).await?,
+            &self.dataset.branch_location().path,
+            self.write_shard,
+            DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
+        );
+        // A worker with no own shard must not queue behind another table's
+        // recovery. Serial master fan-out visits many such workers.
+        if manifest_store.refresh_latest().await?.is_none() {
+            return Ok(false);
+        }
+        let _recovery_slot = OWN_WAL_RECOVERY_SLOT
+            .acquire()
+            .await
+            .expect("WAL recovery semaphore is never closed");
+        // Manifest WAL-tip hints can lag acknowledged PUTs, so an existing
+        // own shard needs replay even if its hint says it is empty. The normal
+        // writer open rechecks under its mutex if ingest won the race. Reuse its
+        // normal replay limits (including Lance's streaming seals); changing
+        // those here would also change future ingest's generation sizes because
+        // this writer remains resident. One indivisible entry can exceed the
+        // configured soft memory ceiling.
+        info!(shard = %self.write_shard, "recovering own WAL before cleanup merge");
+        self.resident_writer().await?;
+        // Keep the recovered writer resident so concurrent ingest shares it;
+        // a later cheap flush can also finish sealing if this caller is cancelled.
+        self.flush().await?;
+        Ok(true)
     }
 
     async fn flush_inner(&self) -> LanceResult<FlushOutcome> {
@@ -768,8 +823,8 @@ impl StorageBase {
         let Some(writer) = writer else {
             return Ok(FlushOutcome::Noop);
         };
-        match writer.force_seal_active().await {
-            Ok(()) => {}
+        let fence = match writer.force_seal_active().await {
+            Ok(fence) => fence,
             // A fence means a merge superseded our epoch; the next `put` reopens
             // and replays. Nothing to flush against the dead epoch.
             Err(err) if is_fenced_error(&err) => {
@@ -777,8 +832,8 @@ impl StorageBase {
                 return Ok(FlushOutcome::Fenced);
             }
             Err(err) => return Err(err),
-        }
-        writer.wait_for_flush_drain().await?;
+        };
+        fence.wait().await?;
         Ok(FlushOutcome::Sealed)
     }
 
@@ -888,6 +943,14 @@ impl StorageBase {
         Ok(if committed { pending } else { 0 })
     }
 
+    /// Clone this gate under a short read lock, then drop that read guard before
+    /// awaiting the gate. Hold the permit through preparation and commit.
+    /// Otherwise a second preparation can hold a read lock while waiting for
+    /// memory owned by the first preparation, which needs the write lock to commit.
+    pub fn merge_preparation_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.merge_preparation_gate.clone()
+    }
+
     /// The shared-lock half of a merge: decide whether one is due and read the
     /// flushed generations into memory.
     ///
@@ -897,6 +960,8 @@ impl StorageBase {
     /// due.
     ///
     /// ```ignore
+    /// let merge_gate = { store.read().await.merge_preparation_gate() };
+    /// let _merge = merge_gate.lock().await;
     /// let prepared = { store.read().await.prepare_merge_if_ready(1).await? };
     /// if let Some((manifest_store, manifest, prepared)) = prepared {
     ///     store.write().await.commit_prepared_merge(&manifest_store, &manifest, prepared).await?;
@@ -936,18 +1001,19 @@ impl StorageBase {
             DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
         );
         Ok(manifest_store
-            .read_latest()
+            .refresh_latest()
             .await?
             .map(|manifest| ShardWatermark {
                 shard_id: manifest.shard_id,
                 writer_epoch: manifest.writer_epoch,
                 sealed_through: manifest
-                    .flushed_generations
+                    .sstables
                     .iter()
                     .map(|g| g.generation)
                     .max()
                     .unwrap_or(0),
-                pending_generations: manifest.flushed_generations.len(),
+                pending_generations: manifest.sstables.len(),
+                merged_through: None,
             }))
     }
 
@@ -963,9 +1029,10 @@ impl StorageBase {
             self.write_shard,
             DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
         );
-        Ok(manifest_store.read_latest().await?.is_some_and(|manifest| {
-            manifest.flushed_generations.len() >= self.merge_after_generations
-        }))
+        Ok(manifest_store
+            .refresh_latest()
+            .await?
+            .is_some_and(|manifest| manifest.sstables.len() >= self.merge_after_generations))
     }
 
     /// [`Self::prepare_merge_if_ready`], but seals the active memtable *before*
@@ -978,6 +1045,19 @@ impl StorageBase {
         self.prepare_merge_if_ready_inner(1, true).await
     }
 
+    /// Recover and seal this instance's durable WAL before preparing cleanup.
+    /// The caller MUST own the ingestion writer ID exclusively. A maintenance
+    /// master merging a live worker's sealed shard must use the ordinary
+    /// preparation methods, which never acquire an ingestion epoch.
+    pub async fn prepare_recovered_cleanup_merge(
+        &self,
+    ) -> LanceResult<Option<(ShardManifestStore, ShardManifest, PreparedMerge)>> {
+        if !self.recover_and_flush_own_wal().await? {
+            return Ok(None);
+        }
+        self.prepare_merge_if_ready_inner(1, false).await
+    }
+
     async fn prepare_merge_if_ready_inner(
         &self,
         threshold: usize,
@@ -988,7 +1068,6 @@ impl StorageBase {
             return Ok(None);
         }
         if seal_first {
-            // Materialize anything buffered so it is eligible for this pass.
             self.flush().await?;
         }
         let object_store = self.dataset.object_store(None).await?;
@@ -999,10 +1078,10 @@ impl StorageBase {
             self.write_shard,
             DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
         );
-        let Some(manifest) = manifest_store.read_latest().await? else {
+        let Some(manifest) = manifest_store.refresh_latest().await? else {
             return Ok(None);
         };
-        let pending = manifest.flushed_generations.len();
+        let pending = manifest.sstables.len();
         if pending == 0 || pending < threshold.max(1) {
             return Ok(None);
         }
@@ -1053,13 +1132,11 @@ impl StorageBase {
         let marks = crate::rollout_append::watermarks(&latest).await?;
         let mut manifest = manifest.clone();
         if let Some(high) = marks.get(&self.write_shard) {
-            manifest
-                .flushed_generations
-                .retain(|g| g.generation > *high);
+            manifest.sstables.retain(|g| g.generation > *high);
         }
-        manifest.flushed_generations.sort_by_key(|g| g.generation);
+        manifest.sstables.sort_by_key(|g| g.generation);
         let manifest = &manifest;
-        if manifest.flushed_generations.is_empty() {
+        if manifest.sstables.is_empty() {
             return Ok(None);
         }
 
@@ -1126,11 +1203,11 @@ impl StorageBase {
         // Several sweepers can prepare the same immutable generations under a
         // shared lock. Once the first commit drains them, later prepared copies
         // are stale and must not write the same rows again.
-        let Some(current_manifest) = manifest_store.read_latest().await? else {
+        let Some(current_manifest) = manifest_store.refresh_latest().await? else {
             return Ok(false);
         };
         if !current_manifest
-            .flushed_generations
+            .sstables
             .iter()
             .any(|generation| merged_generations.contains(&generation.generation))
         {
@@ -1156,7 +1233,7 @@ impl StorageBase {
             merged_generations
                 .iter()
                 .max()
-                .map(|high| lance_index::mem_wal::MergedGeneration::new(self.write_shard, *high))
+                .map(|high| lance_index::mem_wal::CompactedSsTable::new(self.write_shard, *high))
         } else {
             None
         };
@@ -1312,12 +1389,12 @@ impl StorageBase {
         // first generation alone exceeds the budget. Leftovers stay pending.
         let mut buffered_bytes = 0usize;
         let budget = if self.merge_max_generations == 0 {
-            manifest.flushed_generations.len()
+            manifest.sstables.len()
         } else {
             self.merge_max_generations
         };
 
-        'generations: for flushed in manifest.flushed_generations.iter().take(budget) {
+        'generations: for flushed in manifest.sstables.iter().take(budget) {
             let gen_uri = format!(
                 "{}/_mem_wal/{}/{}",
                 base_uri, self.write_shard, flushed.path
@@ -1349,8 +1426,11 @@ impl StorageBase {
                             break 'generations;
                         }
                     }
+                    crate::merge_write_scope::wal_batch_read(
+                        batch.num_rows(),
+                        batch.get_array_memory_size(),
+                    );
                     current_batches.push(batch);
-                    crate::merge_write_scope::checkpoint();
                 }
             }
             generation_batches.push((flushed.generation, current_batches));
@@ -1396,7 +1476,7 @@ impl StorageBase {
         &mut self,
         batches: Vec<RecordBatch>,
         merge_schema: Arc<Schema>,
-        watermark: Option<lance_index::mem_wal::MergedGeneration>,
+        watermark: Option<lance_index::mem_wal::CompactedSsTable>,
     ) -> LanceResult<()> {
         // Predicate deletion projects only the key and row IDs, including for
         // unindexed fragments. It can use existing BTree/ZoneMap coverage but
@@ -1425,6 +1505,7 @@ impl StorageBase {
         if let Some(watermark) = watermark {
             let params = WriteParams {
                 mode: WriteMode::Append,
+                write_progress: Some(crate::merge_write_scope::write_progress()),
                 ..Default::default()
             };
             let staged = lance::dataset::InsertBuilder::new(Arc::new(self.dataset.clone()))
@@ -1444,7 +1525,15 @@ impl StorageBase {
                 batches.into_iter().map(Ok::<RecordBatch, ArrowError>),
                 merge_schema,
             );
-            Box::pin(self.dataset.append(reader, None)).await?;
+            Box::pin(self.dataset.append(
+                reader,
+                Some(WriteParams {
+                    mode: WriteMode::Append,
+                    write_progress: Some(crate::merge_write_scope::write_progress()),
+                    ..Default::default()
+                }),
+            ))
+            .await?;
         }
         Ok(())
     }
@@ -1668,17 +1757,22 @@ impl StorageBase {
         config: CompactionConfig,
     ) -> LanceResult<PreparedCompaction> {
         self.ensure_writable()?;
+        // A resident handle may predate another executor's completed rewrite.
+        // Prepare against a fresh immutable view, without changing the caller's
+        // cached handle or the read versions carried into the commit checks.
+        let mut dataset = self.dataset.clone();
+        dataset.checkout_latest().await?;
         let options = Self::compaction_options(&config);
         let tasks = prepare_compaction_files(
-            &self.dataset,
+            &dataset,
             options.clone(),
             config.max_source_fragments.unwrap_or(usize::MAX).max(1),
         )
         .await?;
         Ok(PreparedCompaction {
-            read_version: self.dataset.version().version,
-            uri: self.dataset.uri().to_owned(),
-            schema: Schema::from(self.dataset.schema()),
+            read_version: dataset.version().version,
+            uri: dataset.uri().to_owned(),
+            schema: Schema::from(dataset.schema()),
             options,
             tasks,
         })
@@ -1749,6 +1843,11 @@ impl StorageBase {
         options: Option<CompactionConfig>,
     ) -> LanceResult<CompactionMetrics> {
         self.ensure_writable()?;
+        // Refresh before planning: retrying a stale handle can otherwise keep
+        // rewriting fragments a peer already replaced, even with serial calls.
+        // A rewrite racing after this refresh still goes through Lance's normal
+        // commit conflict checks.
+        self.dataset.checkout_latest().await?;
         let config = options.unwrap_or_default();
 
         let lance_options = Self::compaction_options(&config);
@@ -2083,6 +2182,60 @@ impl StorageBase {
         builder.load().await
     }
 
+    /// Every shard's watermark (highest flushed generation and writer epoch)
+    /// from its latest manifest. Metadata only; bounded-concurrent like
+    /// [`Self::wal_shard_snapshots`], but does not enforce the read cap:
+    /// the scheduler must see an over-cap shard, not be refused by it.
+    pub async fn all_shard_watermarks(&self) -> LanceResult<Vec<ShardWatermark>> {
+        if self.is_version_pinned() {
+            return Ok(Vec::new());
+        }
+        // The base table's MemWAL index is the authority on what has been
+        // merged. A scan must report it, or a lost completion event leaves
+        // a fully merged shard looking pending forever, and an old table's
+        // first contact reads generation 1001 as 1001 pending.
+        let merged = Arc::new(
+            crate::rollout_append::watermarks(&self.dataset)
+                .await
+                .unwrap_or_default(),
+        );
+        let object_store = self.dataset.object_store(None).await?;
+        let branch_path = self.dataset.branch_location().path.clone();
+        let shard_ids = self.dataset.list_mem_wal_latest_shard_ids().await?;
+        let marks: Vec<Option<ShardWatermark>> = stream::iter(shard_ids)
+            .map(|shard_id| {
+                let object_store = object_store.clone();
+                let branch_path = branch_path.clone();
+                let merged = merged.clone();
+                async move {
+                    let manifest_store = ShardManifestStore::new(
+                        object_store,
+                        &branch_path,
+                        shard_id,
+                        DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
+                    );
+                    Ok::<_, LanceError>(manifest_store.refresh_latest().await?.map(|manifest| {
+                        ShardWatermark {
+                            shard_id: manifest.shard_id,
+                            writer_epoch: manifest.writer_epoch,
+                            sealed_through: manifest
+                                .sstables
+                                .iter()
+                                .map(|g| g.generation)
+                                .max()
+                                .unwrap_or(0),
+                            pending_generations: manifest.sstables.len(),
+                            merged_through: merged.get(&manifest.shard_id).copied(),
+                        }
+                    }))
+                }
+            })
+            .buffer_unordered(8)
+            .try_collect()
+            .await?;
+        Ok(marks.into_iter().flatten().collect())
+    }
+
     /// Read the latest manifest for every MemWAL shard. Manifest reads are
     /// bounded-concurrent so stores with many writer instances do not pay one
     /// object-store round trip per shard serially.
@@ -2110,10 +2263,10 @@ impl StorageBase {
                         shard_id,
                         DEFAULT_MANIFEST_SCAN_BATCH_SIZE,
                     );
-                    let Some(manifest) = manifest_store.read_latest().await? else {
+                    let Some(manifest) = manifest_store.refresh_latest().await? else {
                         return Ok(None);
                     };
-                    let pending = manifest.flushed_generations.len();
+                    let pending = manifest.sstables.len();
                     observe_value!(crate::metrics::ROLLOUT_WAL_PENDING_GENERATIONS, pending);
                     if max_at != 0 && pending > max_at {
                         // A read over this shard would open `pending` datasets
@@ -2146,9 +2299,8 @@ impl StorageBase {
                     let mut snapshot = ShardSnapshot::new(shard_id)
                         .with_spec_id(manifest.shard_spec_id)
                         .with_current_generation(manifest.current_generation);
-                    for flushed in manifest.flushed_generations {
-                        snapshot =
-                            snapshot.with_flushed_generation(flushed.generation, flushed.path);
+                    for sstable in manifest.sstables {
+                        snapshot = snapshot.with_sstable(sstable.generation, sstable.path);
                     }
                     Ok::<_, LanceError>(Some(snapshot))
                 }
@@ -2164,7 +2316,7 @@ impl StorageBase {
         // and still opened 25k datasets on one lookup (OOMKilled the worker).
         let total: usize = snapshots
             .iter()
-            .map(|snapshot| snapshot.flushed_generations.len())
+            .map(|snapshot| snapshot.sstables.len())
             .sum();
         if max_at != 0 && total > max_at {
             note_read_refused(self.dataset.uri());
@@ -2185,7 +2337,7 @@ impl StorageBase {
             .wal_shard_snapshots()
             .await?
             .iter()
-            .map(|snapshot| snapshot.flushed_generations.len())
+            .map(|snapshot| snapshot.sstables.len())
             .sum())
     }
 
@@ -2195,7 +2347,7 @@ impl StorageBase {
         let generation_paths: Vec<String> = snapshots
             .iter()
             .flat_map(|snapshot| {
-                snapshot.flushed_generations.iter().map(|generation| {
+                snapshot.sstables.iter().map(|generation| {
                     self.flushed_generation_uri(snapshot.shard_id, &generation.path)
                 })
             })
@@ -2225,10 +2377,15 @@ impl StorageBase {
 
     /// Read a fresh base/WAL view and retry if a merge invalidates it. A merge
     /// commits base before draining/deleting its generations, so an unchanged
-    /// base version brackets a successful read. Retry missing generations even
-    /// when the base version is unchanged. Never return a partial result after
-    /// a generation disappears. Ordinary WAL appends do not change base and do
-    /// not force retries. Pinned reads use only their selected base version.
+    /// base version must bracket the WAL manifest capture. Validate that pair
+    /// before reading payloads. A later commit does not invalidate a completed
+    /// read of that snapshot. Retry missing generations even when the base
+    /// version is unchanged; never return a partial result after one disappears.
+    /// Ordinary WAL appends do not force retries. Pinned reads use only their
+    /// selected base version. A progressing merge may invalidate several fresh
+    /// views in a few milliseconds: bound refreshes separately from repeated
+    /// missing-file failures at the same base version. The retry budget limits
+    /// starting another attempt, not the duration of an otherwise valid scan.
     pub async fn read_consistent<T, F, Fut>(
         &self,
         source: ListSource,
@@ -2238,7 +2395,16 @@ impl StorageBase {
         F: FnMut(Dataset, Vec<ShardSnapshot>) -> Fut,
         Fut: std::future::Future<Output = LanceResult<T>>,
     {
-        for attempt in 0..3 {
+        const MAX_SNAPSHOT_ATTEMPTS: usize = 16;
+        const MAX_MISSING_AT_VERSION: usize = 3;
+        let started = std::time::Instant::now();
+        let retry_budget = std::time::Duration::from_secs(2);
+        let mut last_missing_version = None;
+        let mut missing_at_version = 0;
+        for attempt in 0..MAX_SNAPSHOT_ATTEMPTS {
+            if attempt != 0 && started.elapsed() >= retry_budget {
+                break;
+            }
             let mut dataset = self.dataset.clone();
             if !self.is_version_pinned() {
                 dataset.checkout_latest().await?;
@@ -2249,12 +2415,38 @@ impl StorageBase {
             } else {
                 self.wal_shard_snapshots().await?
             };
+            if !self.is_version_pinned() {
+                let mut latest = dataset.clone();
+                latest.checkout_latest().await?;
+                if latest.manifest.version != version {
+                    // A merge could have drained WAL after we opened base.
+                    // Retry this metadata pair before scanning any payloads,
+                    // otherwise the view could omit its newly merged rows.
+                    continue;
+                }
+            }
             let result = read(dataset.clone(), snapshots).await;
             if self.is_version_pinned() {
                 return result;
             }
             if let Err(err) = &result {
-                if !is_not_found_error(err) || attempt == 2 {
+                if !is_not_found_error(err) {
+                    return result;
+                }
+                if last_missing_version == Some(version) {
+                    missing_at_version += 1;
+                } else {
+                    last_missing_version = Some(version);
+                    missing_at_version = 1;
+                }
+                // Actual base commits justify refreshing again, but repeated
+                // failures without base progress retain the old three-attempt
+                // bound. Neither continuous commits nor missing data permit
+                // unlimited repeated payload decoding.
+                if missing_at_version >= MAX_MISSING_AT_VERSION
+                    || attempt + 1 == MAX_SNAPSHOT_ATTEMPTS
+                    || started.elapsed() >= retry_budget
+                {
                     return result;
                 }
                 // A merge may already have committed before this read began.
@@ -2262,10 +2454,12 @@ impl StorageBase {
                 // the base version. Refresh both snapshots even in that case.
                 continue;
             }
-            dataset.checkout_latest().await?;
-            if dataset.manifest.version == version {
-                return result;
-            }
+            // The immutable base/WAL view was complete at capture. A commit
+            // after capture may force a missing-file retry, but cannot make
+            // successfully read rows disappear. Requiring the base to stay
+            // unchanged throughout payload decoding starves reads under
+            // continuous merging and repeats all their decoding work.
+            return result;
         }
         Err(LanceError::io(
             "dataset changed during read; retry the request",
@@ -2403,7 +2597,8 @@ impl StorageBase {
             handler,
         )));
 
-        Dataset::write(batches, uri, Some(params)).await
+        crate::merge_write_scope::at_initial_version(Dataset::write(batches, uri, Some(params)))
+            .await
     }
 }
 
@@ -2473,12 +2668,10 @@ pub(crate) fn is_fenced_error(err: &LanceError) -> bool {
 
 /// Whether a Lance error means the target dataset/path does not exist.
 ///
-/// Used by WAL read fallbacks to skip a flushed generation that a concurrent
-/// merge drained from the shard manifest and deleted between the manifest
-/// snapshot and the open — the row's data is already in the base table, so
-/// skipping is safe and avoids a transient failure. Both the structured
-/// not-found variants and the object-store "not found" surface are matched; the
-/// latter is text-based because it arrives as a generic wrapped IO error.
+/// WAL reads can race with a merge draining and deleting a generation. A read
+/// must then refresh its base/WAL view, not return a partial result. Both the
+/// structured variants and the object-store message are matched; the latter
+/// can arrive as a generic wrapped IO error with different capitalization.
 pub(crate) fn is_not_found_error(err: &LanceError) -> bool {
     if matches!(
         err,
@@ -2486,8 +2679,8 @@ pub(crate) fn is_not_found_error(err: &LanceError) -> bool {
     ) {
         return true;
     }
-    let text = err.to_string();
-    text.contains("was not found") || text.contains("not found") || text.contains("NotFound")
+    let text = err.to_string().to_ascii_lowercase();
+    text.contains("not found") || text.contains("notfound")
 }
 
 /// Keep the newest prepared row for each merge key.
@@ -2608,14 +2801,16 @@ pub(crate) fn align_batch_to_schema(
 /// is: a single store answered 503 for five hours today before anyone
 /// noticed. The label is the dataset directory name, bounded by the number
 /// of stores a worker touches.
-fn note_read_refused(uri: &str) {
-    let store = uri
-        .trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .unwrap_or("unknown")
-        .to_string();
-    metrics::counter!("rollout_reads_refused_pending_total", "store" => store).increment(1);
+fn note_read_refused(_uri: &str) {
+    count!(
+        "rollout_reads_refused_pending_total",
+        "store" => _uri
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or("unknown")
+            .to_string(),
+    );
 }
 
 /// Derive the MemWAL shard UUID a server instance writes to from its stable
@@ -2627,4 +2822,29 @@ fn note_read_refused(uri: &str) {
 pub fn derive_shard_id(instance_id: Option<&str>) -> Uuid {
     let input = instance_id.unwrap_or("default");
     Uuid::new_v5(&Uuid::NAMESPACE_OID, input.as_bytes())
+}
+
+#[cfg(test)]
+mod cold_recovery_tests {
+    use super::OWN_WAL_RECOVERY_SLOT;
+    use crate::RolloutStore;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn empty_shard_cleanup_does_not_wait_for_other_recovery() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = RolloutStore::open(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let _occupied = OWN_WAL_RECOVERY_SLOT.acquire().await.unwrap();
+        let prepared = tokio::time::timeout(
+            Duration::from_secs(2),
+            store.prepare_recovered_cleanup_merge(),
+        )
+        .await
+        .expect("absent own shard must bypass cold recovery admission")
+        .unwrap();
+        assert!(prepared.is_none());
+        assert!(store.own_shard_watermark().await.unwrap().is_none());
+    }
 }

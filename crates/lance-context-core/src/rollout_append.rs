@@ -16,7 +16,7 @@ use lance::dataset::{
     CommitBuilder, Dataset, InsertBuilder, WriteMode, WriteParams,
 };
 use lance::index::DatasetIndexExt;
-use lance_index::mem_wal::{MemWalIndexDetails, MergedGeneration, MEM_WAL_INDEX_NAME};
+use lance_index::mem_wal::{CompactedSsTable, MemWalIndexDetails, MEM_WAL_INDEX_NAME};
 use lance_table::format::{pb, Fragment};
 use lance_table::system_index::mem_wal::ShardManifest;
 use serde::{Deserialize, Serialize};
@@ -273,6 +273,15 @@ pub enum StageEvent {
     Failed(String),
 }
 
+/// Merged generation watermark per shard, read from the base table's MemWAL
+/// index at its latest version. Public so executors can report what they
+/// merged alongside releasing ownership. Empty when the table has no WAL
+/// index yet.
+pub async fn merged_watermarks(uri: &str) -> Result<HashMap<Uuid, u64>> {
+    let dataset = Dataset::open(uri).await?;
+    watermarks(&dataset).await
+}
+
 pub(crate) async fn watermarks(dataset: &Dataset) -> Result<HashMap<Uuid, u64>> {
     let indices = dataset.load_indices().await?;
     let Some(index) = indices.iter().find(|i| i.name == MEM_WAL_INDEX_NAME) else {
@@ -284,7 +293,7 @@ pub(crate) async fn watermarks(dataset: &Dataset) -> Result<HashMap<Uuid, u64>> 
         .ok_or_else(|| Error::io("MemWAL index has no details"))?;
     let details = MemWalIndexDetails::try_from(details.to_msg::<pb::MemWalIndexDetails>()?)?;
     Ok(details
-        .merged_generations
+        .compacted_sstables
         .into_iter()
         .map(|g| (g.shard_id, g.generation))
         .collect())
@@ -306,11 +315,11 @@ pub(crate) async fn reconcile_shard(dataset: &Dataset, shard: Uuid) -> Result<us
         return Ok(0);
     };
     let store = shard_store(dataset, shard).await?;
-    let Some(manifest) = store.read_latest().await? else {
+    let Some(manifest) = store.refresh_latest().await? else {
         return Ok(0);
     };
     let generations: HashSet<_> = manifest
-        .flushed_generations
+        .sstables
         .iter()
         .filter(|g| g.generation <= high)
         .map(|g| g.generation)
@@ -318,7 +327,7 @@ pub(crate) async fn reconcile_shard(dataset: &Dataset, shard: Uuid) -> Result<us
     let count = generations.len();
     if count > 0 {
         let paths: Vec<_> = manifest
-            .flushed_generations
+            .sstables
             .iter()
             .filter(|g| generations.contains(&g.generation))
             .map(|g| g.path.clone())
@@ -351,6 +360,37 @@ pub(crate) async fn reconcile_shard(dataset: &Dataset, shard: Uuid) -> Result<us
     Ok(count)
 }
 
+/// Metadata-only WAL demand probe for rollout and generic tables. This opens no
+/// writer, evolves no schema, and reads no generation payloads.
+pub async fn has_sealed_wal(
+    uri: &str,
+    session: Option<Arc<Session>>,
+    shards: &[String],
+) -> Result<bool> {
+    let dataset = StorageBase::load_with_options(uri, None, session).await?;
+    dataset_has_sealed_wal(&dataset, shards).await
+}
+
+async fn dataset_has_sealed_wal(dataset: &Dataset, shards: &[String]) -> Result<bool> {
+    if shards.is_empty() || shards.len() > 256 {
+        return Err(Error::invalid_input(
+            "expected 1..=256 WAL shard identities",
+        ));
+    }
+    let mut seen = HashSet::new();
+    for name in shards {
+        let id = derive_shard_id(Some(name));
+        if seen.insert(id) {
+            if let Some(manifest) = shard_store(dataset, id).await?.refresh_latest().await? {
+                if !manifest.sstables.is_empty() {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// The only publisher. Open this inside the existing MergeWriteScope so both
 /// table commits and shard drains retain ownership checks and version fencing.
 pub struct AppendCoordinator {
@@ -363,7 +403,9 @@ impl AppendCoordinator {
         let dataset = StorageBase::load_with_options(uri, None, session).await?;
         let actual: Schema = dataset.schema().into();
         let expected = crate::rollout_schema();
-        if dataset.manifest().should_use_legacy_format() {
+        if dataset.manifest().data_storage_format.version
+            == lance_file::version::ConcreteFileVersion::V1
+        {
             return Err(Error::invalid_input(
                 "rollout staging requires Lance V2 files",
             ));
@@ -384,23 +426,7 @@ impl AppendCoordinator {
     /// No writer opens, raw WAL replay, generation payload reads, or publication.
     /// Committed-but-undrained generations also need a maintenance pass.
     pub async fn has_sealed_wal(&self, shards: &[String]) -> Result<bool> {
-        if shards.is_empty() || shards.len() > 256 {
-            return Err(Error::invalid_input(
-                "expected 1..=256 WAL shard identities",
-            ));
-        }
-        let mut seen = HashSet::new();
-        for name in shards {
-            let id = derive_shard_id(Some(name));
-            if seen.insert(id) {
-                if let Some(manifest) = shard_store(&self.dataset, id).await?.read_latest().await? {
-                    if !manifest.flushed_generations.is_empty() {
-                        return Ok(true);
-                    }
-                }
-            }
-        }
-        Ok(false)
+        dataset_has_sealed_wal(&self.dataset, shards).await
     }
 
     pub async fn plan(
@@ -443,7 +469,7 @@ impl AppendCoordinator {
             reclaimed += reconcile_shard(&self.dataset, shard).await?;
             let Some(manifest) = shard_store(&self.dataset, shard)
                 .await?
-                .read_latest()
+                .refresh_latest()
                 .await?
             else {
                 continue;
@@ -481,7 +507,7 @@ impl AppendCoordinator {
             let cutoff = if previous_epoch != Some(manifest.writer_epoch) || prior_ranges.is_none()
             {
                 let high = manifest
-                    .flushed_generations
+                    .sstables
                     .iter()
                     .map(|g| g.generation)
                     .max()
@@ -546,7 +572,7 @@ impl AppendCoordinator {
                 previous_cutoff.unwrap_or(0)
             };
             let mut generations: Vec<_> = manifest
-                .flushed_generations
+                .sstables
                 .into_iter()
                 .map(|g| Generation {
                     number: g.generation,
@@ -639,10 +665,10 @@ impl AppendCoordinator {
             }
             let manifest = shard_store(&self.dataset, part.plan.shard)
                 .await?
-                .read_latest()
+                .refresh_latest()
                 .await?
                 .ok_or_else(|| Error::io("staged shard disappeared"))?;
-            let mut pending: Vec<_> = manifest.flushed_generations.iter().collect();
+            let mut pending: Vec<_> = manifest.sstables.iter().collect();
             pending.sort_by_key(|g| g.generation);
             if pending.len() < selected.len()
                 || pending
@@ -662,7 +688,7 @@ impl AppendCoordinator {
                 return Err(Error::invalid_input("staged row count mismatch"));
             }
             fragments.extend(part.fragments);
-            merged.push(MergedGeneration::new(part.plan.shard, high));
+            merged.push(CompactedSsTable::new(part.plan.shard, high));
         }
         if !merged.is_empty() {
             commit_files(&mut self.dataset, fragments, merged).await?;
@@ -685,7 +711,7 @@ pub(crate) fn has_cutover(dataset: &Dataset, shard: Uuid) -> bool {
 pub(crate) async fn commit_files(
     dataset: &mut Dataset,
     fragments: Vec<Fragment>,
-    merged: Vec<MergedGeneration>,
+    merged: Vec<CompactedSsTable>,
 ) -> Result<()> {
     let _phase = crate::merge_write_scope::work_stage("base_commit");
     let operation = Operation::Update {
@@ -693,7 +719,7 @@ pub(crate) async fn commit_files(
         updated_fragments: Vec::new(),
         new_fragments: fragments,
         fields_modified: Vec::new(),
-        merged_generations: merged,
+        compacted_sstables: merged,
         fields_for_preserving_frag_bitmap: Vec::new(),
         update_mode: None,
         inserted_rows_filter: None,
@@ -728,7 +754,9 @@ pub async fn stage(
         .await?;
     let dataset_uri = dataset.uri().to_owned();
     let schema: Arc<Schema> = Arc::new(dataset.schema().into());
-    if dataset.manifest().should_use_legacy_format() {
+    if dataset.manifest().data_storage_format.version
+        == lance_file::version::ConcreteFileVersion::V1
+    {
         return Err(Error::invalid_input(
             "rollout staging requires Lance V2 files",
         ));
@@ -1478,7 +1506,7 @@ mod tests {
         assert_eq!(rows(uri).await, 2);
         let shard = derive_shard_id(Some("a"));
         let store = shard_store(&coordinator.dataset, shard).await.unwrap();
-        let before = store.read_latest().await.unwrap().unwrap();
+        let before = store.refresh_latest().await.unwrap().unwrap();
         // Reproduce a persisted replay cursor lagging the last durable flush.
         // The WAL bytes survive a merge; reopening can replay the old tail into
         // a NEW generation even though its original generation was committed.
@@ -1496,9 +1524,9 @@ mod tests {
             .add(&[artifact_record("new", &[42; 4096])])
             .await
             .unwrap();
-        let opened = store.read_latest().await.unwrap().unwrap();
+        let opened = store.refresh_latest().await.unwrap().unwrap();
         assert!(opened.writer_epoch > before.writer_epoch);
-        assert!(opened.flushed_generations.is_empty());
+        assert!(opened.sstables.is_empty());
         // Planning may observe the new epoch before its replay memtable flushes.
         // It must protect that active generation, not only the empty disk prefix.
         let (empty, _) = coordinator
@@ -1555,7 +1583,7 @@ mod tests {
         a.close().await.unwrap();
         let shard = derive_shard_id(Some("a"));
         let store = shard_store(&coordinator.dataset, shard).await.unwrap();
-        let before = store.read_latest().await.unwrap().unwrap();
+        let before = store.refresh_latest().await.unwrap().unwrap();
         // Real replay: lag the durable cursor, so reopening replays "tail" and
         // the eight still-pending rows into the first generation of the epoch.
         store
@@ -1649,13 +1677,13 @@ mod tests {
         let mut clean = Vec::new();
         for epoch in 0..3 {
             put(&a, &format!("first-{epoch}"), 4096).await;
-            let current = store.read_latest().await.unwrap().unwrap();
+            let current = store.refresh_latest().await.unwrap().unwrap();
             clean.push(current.current_generation);
             put(&a, &format!("steady-{epoch}"), 4096).await;
             a.close().await.unwrap();
             expected.push(
                 store
-                    .read_latest()
+                    .refresh_latest()
                     .await
                     .unwrap()
                     .unwrap()
@@ -1701,7 +1729,7 @@ mod tests {
         let current = shard_store(&coordinator.dataset, shard)
             .await
             .unwrap()
-            .read_latest()
+            .refresh_latest()
             .await
             .unwrap()
             .unwrap();
@@ -1731,7 +1759,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(state.contains(1));
-        assert!(state.contains(current.flushed_generations[0].generation));
+        assert!(state.contains(current.sstables[0].generation));
         assert!(!state.contains(current.current_generation));
         a.close().await.unwrap();
     }
@@ -1760,7 +1788,7 @@ mod tests {
             .unwrap();
         let shard = derive_shard_id(Some("a"));
         let store = shard_store(&coordinator.dataset, shard).await.unwrap();
-        let current = store.read_latest().await.unwrap().unwrap();
+        let current = store.refresh_latest().await.unwrap().unwrap();
         // Remove only old metadata, retaining the exact latest version so that
         // normal WAL discovery and publication are still possible.
         let manifest_dir = dir
@@ -1828,7 +1856,7 @@ mod tests {
         let current = shard_store(&coordinator.dataset, shard)
             .await
             .unwrap()
-            .read_latest()
+            .refresh_latest()
             .await
             .unwrap()
             .unwrap();
@@ -1854,7 +1882,7 @@ mod tests {
             base_version: coordinator.version(),
             shard,
             generations: current
-                .flushed_generations
+                .sstables
                 .iter()
                 .map(|g| Generation {
                     number: g.generation,

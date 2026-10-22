@@ -22,6 +22,9 @@ use axum::{
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use metrics_process::Collector;
 
+mod recovery_signals;
+mod runtime_resources;
+
 /// Explicit histogram buckets (upper bounds, seconds) for request-scale latency
 /// metrics — anything matching the `_duration_seconds` suffix.
 ///
@@ -311,11 +314,13 @@ fn describe_metrics() {
     );
 }
 
-/// Router exposing `GET /metrics` (relative to wherever it is nested/merged).
+/// Process metrics and fresh, read-only cgroup observations for recovery admission.
 pub fn metrics_router(handle: MetricsHandle) -> Router {
     Router::new()
         .route("/metrics", get(render))
         .with_state(handle)
+        .merge(runtime_resources::router())
+        .merge(recovery_signals::router())
 }
 
 async fn render(State(handle): State<MetricsHandle>) -> impl IntoResponse {
@@ -337,10 +342,13 @@ pub async fn http_metrics_layer(req: Request<axum::body::Body>, next: Next) -> R
         .map(|p| p.as_str().to_owned())
         .unwrap_or_else(|| "unknown".to_owned());
 
+    let recovery_target = recovery_signals::target(req.uri().path(), &path, &method);
     let response = next.run(req).await;
+    let elapsed = start.elapsed();
+    recovery_signals::record(recovery_target, response.status(), elapsed);
 
     let status = response.status().as_u16().to_string();
-    let elapsed = start.elapsed().as_secs_f64();
+    let elapsed = elapsed.as_secs_f64();
     let labels = [
         ("method", method.to_string()),
         ("path", path),
@@ -391,6 +399,18 @@ mod tests {
         metrics::gauge!("master_experiments").set(3.0);
 
         let app = metrics_router(handle);
+        let invalid_nonce = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/internal/runtime-resources?nonce=invalid%20nonce")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_nonce.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(invalid_nonce.headers()["cache-control"], "no-store");
         let resp = app
             .oneshot(
                 Request::builder()

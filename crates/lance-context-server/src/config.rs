@@ -28,6 +28,16 @@ pub struct ServerConfig {
     )]
     pub http_shutdown_response_idle_secs: u64,
 
+    /// Stable worker URL reachable by the master for execution identity and
+    /// cancellation. Required when MERGE_FENCE_LEGACY is enabled.
+    #[arg(long, env = "MERGE_EXECUTOR_ENDPOINT")]
+    pub merge_executor_endpoint: Option<String>,
+
+    /// Persist fencing for only this stable INSTANCE_ID. Unlike
+    /// MERGE_FENCE_LEGACY this does not activate a cluster-wide protocol switch.
+    #[arg(long, env = "MERGE_FENCE_THIS_WORKER", default_value_t = false)]
+    pub merge_fence_this_worker: bool,
+
     /// Legacy wire field; owned merges now use the real-progress idle timeout.
     #[arg(long, env = "MERGE_EXECUTION_TIMEOUT_SECS", default_value_t = 3600)]
     pub merge_execution_timeout_secs: u64,

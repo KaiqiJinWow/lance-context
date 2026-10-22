@@ -107,6 +107,7 @@ pub struct MasterState {
     pub admission: Arc<crate::admission::Admission>,
     /// Shared HTTP client for fanning `MergeWal` tasks out to worker endpoints.
     pub http: reqwest::Client,
+    pub(crate) legacy_response_waiters: Arc<Semaphore>,
     /// Explicit resident-master staging shares one byte budget and cache session.
     pub(crate) local_append: Option<crate::rollout_append::LocalStaging>,
     /// Process-wide compaction permits shared by scheduler and retirement work.
@@ -135,7 +136,7 @@ pub(crate) fn worker_http_client() -> Result<reqwest::Client, reqwest::Error> {
 
 impl MasterState {
     /// Open the registry, stats dataset, and configured durable task store.
-    pub async fn new(config: MasterConfig) -> lance::Result<Arc<Self>> {
+    pub async fn new(mut config: MasterConfig) -> lance::Result<Arc<Self>> {
         config.merge_rollout.validate().map_err(lance::Error::io)?;
         config.catchup.validate().map_err(lance::Error::io)?;
         config
@@ -150,7 +151,21 @@ impl MasterState {
                 "maintenance deadlines must be positive",
             ));
         }
+        if config.legacy_merge_foreground_secs == 0 {
+            return Err(lance::Error::invalid_input(
+                "legacy foreground interval must be positive",
+            ));
+        }
         let task_store = TaskStore::open(&config).await?;
+        config.merge_rollout.fence_legacy = task_store
+            .merge_coordinator()
+            .legacy_fencing_mode(config.merge_rollout.fence_legacy)
+            .await
+            .map_err(lance::Error::io)?;
+        // Protocol activation covers every master maintenance writer as well
+        // as workers; a flag rollback must not restore unrecorded rewrites.
+        config.maintenance.fence_legacy_maintenance |= config.merge_rollout.fence_legacy;
+        crate::local_merge::validate(&config).map_err(lance::Error::io)?;
         // Serialize first-time registry/stats creation and legacy backfill in
         // etcd mode. Followers wait briefly rather than racing Lance creates.
         let dedicated = config.catchup.target.is_some();
@@ -216,7 +231,7 @@ impl MasterState {
         if let Some(guard) = init_guard {
             task_store.release_coordination_lock(guard).await?;
         }
-        let local_append = config.append.rollout_append_local.then(|| {
+        let local_append = crate::local_merge::enabled(&config).then(|| {
             crate::rollout_append::LocalStaging::new(
                 config.append.rollout_append_local_memory_bytes,
             )
@@ -232,6 +247,7 @@ impl MasterState {
             )),
             rollout_session,
             base_uri,
+            legacy_response_waiters: Arc::new(Semaphore::new(config.legacy_merge_wait_concurrency)),
             config,
             task_store,
             admission: Arc::new(crate::admission::Admission::default()),
@@ -319,9 +335,12 @@ mod tests {
 
     fn test_config(dir: &TempDir) -> MasterConfig {
         MasterConfig {
+            legacy_retirement_request: None,
+            local_merge: Default::default(),
             append: Default::default(),
             catchup: Default::default(),
             wal_tail: Default::default(),
+            planner: Default::default(),
             maintenance: Default::default(),
             merge_rollout: Default::default(),
             data_dir: dir.path().to_string_lossy().to_string(),
@@ -349,6 +368,8 @@ mod tests {
             worker_endpoints: vec![],
             task_concurrency: 4,
             merge_wal_concurrency: 4,
+            legacy_merge_wait_concurrency: 32,
+            legacy_merge_foreground_secs: 30,
             etcd: lance_context_core::etcd::EtcdConfig {
                 etcd_endpoints: std::env::var("ETCD_TEST_ENDPOINTS")
                     .map(|value| value.split(',').map(str::to_string).collect())

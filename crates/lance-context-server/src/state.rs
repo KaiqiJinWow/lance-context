@@ -364,13 +364,46 @@ impl AppState {
                 "merge execution, queue and idle timeouts must be positive".into(),
             ));
         }
+        if config.merge_fence_this_worker && instance_id.as_deref().is_none_or(str::is_empty) {
+            return Err(AppError::InvalidRequest(
+                "worker fencing requires a stable INSTANCE_ID or HOSTNAME".into(),
+            ));
+        }
+        if config.merge_rollout.fence_legacy
+            || config.merge_fence_this_worker
+            || config.merge_executor_endpoint.is_some()
+        {
+            let endpoint = config.merge_executor_endpoint.as_deref().unwrap_or("");
+            let valid_endpoint = endpoint.parse::<axum::http::Uri>().is_ok_and(|url| {
+                matches!(url.scheme_str(), Some("http" | "https"))
+                    && url
+                        .authority()
+                        .is_some_and(|a| !a.host().is_empty() && !a.as_str().contains('@'))
+                    && url.query().is_none()
+                    && matches!(url.path(), "" | "/")
+                    && !endpoint.contains('#')
+            });
+            if !valid_endpoint
+                || config.etcd.etcd_endpoints.is_empty()
+                || config.rollout_merge_concurrency == 0
+            {
+                return Err(AppError::InvalidRequest(
+                    "fenced legacy merges require ETCD_ENDPOINTS, a stable MERGE_EXECUTOR_ENDPOINT and positive ROLLOUT_MERGE_CONCURRENCY".into(),
+                ));
+            }
+        }
         Ok(Self {
             merge_executions: crate::merge_execution::Executions::configured(
                 config.merge_etcd_config(),
                 config.merge_rollout.clone(),
+                config.merge_executor_endpoint.clone(),
                 config.merge_execution_timeout_secs,
                 config.merge_queue_timeout_secs,
                 config.merge_idle_timeout_secs,
+                crate::merge_execution::WorkerAdmission {
+                    writer_id: instance_id.clone(),
+                    enable_fencing: config.merge_fence_this_worker,
+                },
             ),
             stores: RwLock::new(std::collections::HashMap::new()),
             rollout_stores: Mutex::new(LruCache::new(capacity)),
@@ -554,23 +587,20 @@ impl AppState {
         // Keep the registry entry and cached handle until physical deletion
         // succeeds, so failures can be retried without losing the store's URI.
         let registry = &self.rollout_registry;
-        if !registry
-            .contains(name)
-            .await
-            .map_err(AppError::from_lance)?
-        {
+        let Some(entry) = registry.get(name).await.map_err(AppError::from_lance)? else {
             return Ok(false);
-        }
+        };
         let live = handle.upgrade();
         if let Some(store) = live {
-            store
-                .write()
-                .await
-                .delete_data()
-                .await
-                .map_err(AppError::from_lance)?;
+            let mut store = store.write().await;
+            if store.uri() != entry.uri {
+                return Err(AppError::Overloaded(format!(
+                    "Rollout store '{name}' registry changed; refusing to delete a different dataset"
+                )));
+            }
+            store.delete_data().await.map_err(AppError::from_lance)?;
         } else {
-            lance_context_core::remove_dataset(&self.rollout_uri(name))
+            lance_context_core::remove_dataset(&entry.uri)
                 .await
                 .map_err(AppError::from_lance)?;
         }
@@ -610,36 +640,40 @@ impl AppState {
             return Ok(store);
         }
 
-        // Existence is the registry's job, not the cache's.
-        let exists = self
+        // The registry owns both existence and the physical dataset location.
+        let entry = self
             .rollout_registry
-            .contains(name)
+            .get(name)
             .await
-            .map_err(AppError::from_lance)?;
-        if !exists {
-            return Err(AppError::NotFound(format!(
-                "Rollout store '{}' does not exist",
-                name
-            )));
-        }
+            .map_err(AppError::from_lance)?
+            .ok_or_else(|| AppError::NotFound(format!("Rollout store '{name}' does not exist")))?;
 
         // Load from storage WITHOUT holding the LRU lock, so a slow open does
         // not block other stores' requests.
-        let uri = self.rollout_uri(name);
-        let opened = RolloutStore::open_existing_with_options(&uri, self.rollout_store_options())
-            .await
-            .map_err(AppError::from_lance)?;
+        let opened =
+            RolloutStore::open_existing_with_options(&entry.uri, self.rollout_store_options())
+                .await
+                .map_err(AppError::from_lance)?;
         let opened = Arc::new(RwLock::new(opened));
-        // Also observe registry removal by another server during the open.
-        let registry = &self.rollout_registry;
-        if !registry
-            .contains(name)
+        // Reject a removal or replacement observed during this open. This is
+        // not a distributed lease: cached handles still need lifecycle fencing.
+        match self
+            .rollout_registry
+            .get(name)
             .await
             .map_err(AppError::from_lance)?
         {
-            return Err(AppError::NotFound(format!(
-                "Store '{name}' was deleted while opening"
-            )));
+            Some(current) if current == entry => {}
+            Some(_) => {
+                return Err(AppError::Overloaded(format!(
+                    "Rollout store '{name}' registry changed while opening; retry"
+                )));
+            }
+            None => {
+                return Err(AppError::NotFound(format!(
+                    "Store '{name}' was deleted while opening"
+                )));
+            }
         }
         // The per-name lock excludes deletion and concurrent opens through
         // publication in both the weak registry and the resident cache.
@@ -1165,6 +1199,9 @@ impl AppState {
         }
     }
 }
+
+#[cfg(test)]
+mod registry_tests;
 
 #[cfg(test)]
 mod tests {

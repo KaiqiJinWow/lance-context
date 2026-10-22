@@ -572,6 +572,150 @@ pub async fn list_cooldowns(
         .map_err(MasterError::from_lance)
 }
 
+#[derive(Deserialize, Default)]
+pub struct DemandQuery {
+    pub target: Option<String>,
+    /// List mode only: at most this many tables, highest pending first.
+    /// Default 200, max 2000.
+    pub limit: Option<usize>,
+    /// List mode only: include tables with zero pending generations.
+    #[serde(default)]
+    pub include_idle: bool,
+}
+
+/// One table's demand as the planner sees it. The full record is included
+/// only for a single-target query; the list view carries the summary.
+#[derive(Debug, Serialize)]
+pub struct DemandView {
+    pub target: String,
+    pub pending_generations: u64,
+    pub pending_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_pending_ms: Option<i64>,
+    pub shards: usize,
+    pub observed_revision: i64,
+    pub updated_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record: Option<lance_context_merge::demand::TableDemand>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DemandReport {
+    /// Whether some master currently holds planner leadership.
+    pub leader: Option<crate::planner::LeaderRecord>,
+    /// Tables in the cache (list mode), before `limit`/`include_idle`.
+    pub total_tables: usize,
+    /// Tables with pending > 0 in the cache (list mode).
+    pub tables_with_pending: usize,
+    pub tables: Vec<DemandView>,
+}
+
+/// `GET /api/v1/scheduler/demand[?target=|?limit=&include_idle=]` — the
+/// planner's demand cache, folded from per-shard watermark events.
+/// Read-only. With `target`, one table with its full record. Without, a
+/// paged read of the whole cache (13k tables is tens of pages) reduced to a
+/// bounded, pending-sorted summary so the response is never the size of
+/// the cache. Absent while no planner has run.
+pub async fn scheduler_demand(
+    State(state): State<Arc<MasterState>>,
+    Query(query): Query<DemandQuery>,
+) -> Result<Json<DemandReport>, MasterError> {
+    use lance_context_merge::demand::TableDemand;
+    let keys = crate::planner::Keys::new(&state.config.etcd.etcd_prefix);
+    let client = state.task_store.etcd_client();
+    let leader = client
+        .clone()
+        .get(keys.leader(), None)
+        .await
+        .map_err(|e| MasterError::Internal(e.to_string()))?
+        .kvs()
+        .first()
+        .and_then(|kv| serde_json::from_slice(kv.value()).ok());
+    let prefix = keys.demand_prefix();
+    let view = |key: &[u8], record: TableDemand, full: bool| {
+        let key = String::from_utf8_lossy(key);
+        let target = key
+            .strip_prefix(prefix.as_str())
+            .and_then(crate::planner::unhex)
+            .unwrap_or_else(|| key.to_string());
+        DemandView {
+            target,
+            pending_generations: record.pending_generations(),
+            pending_bytes: record.pending_bytes(),
+            oldest_pending_ms: record.oldest_pending_ms(),
+            shards: record.shards.len(),
+            observed_revision: record.observed_revision,
+            updated_ms: record.updated_ms,
+            record: full.then_some(record),
+        }
+    };
+    if let Some(target) = &query.target {
+        if target.is_empty() || target.len() > 512 {
+            return Err(MasterError::InvalidRequest("invalid target".into()));
+        }
+        let got = client
+            .clone()
+            .get(keys.demand(target), None)
+            .await
+            .map_err(|e| MasterError::Internal(e.to_string()))?;
+        let tables: Vec<DemandView> = got
+            .kvs()
+            .iter()
+            .filter_map(|kv| {
+                serde_json::from_slice::<TableDemand>(kv.value())
+                    .ok()
+                    .map(|r| view(kv.key(), r, true))
+            })
+            .collect();
+        let with_pending = tables.iter().filter(|t| t.pending_generations > 0).count();
+        return Ok(Json(DemandReport {
+            leader,
+            total_tables: tables.len(),
+            tables_with_pending: with_pending,
+            tables,
+        }));
+    }
+    let limit = query.limit.unwrap_or(200).clamp(1, 2000);
+    let (kvs, _) = crate::planner::read_prefix_paged(client, &prefix)
+        .await
+        .map_err(MasterError::Internal)?;
+    let total_tables = kvs.len();
+    let mut tables: Vec<DemandView> = kvs
+        .iter()
+        .filter_map(|kv| {
+            serde_json::from_slice::<TableDemand>(&kv.value)
+                .ok()
+                .map(|r| view(&kv.key, r, false))
+        })
+        .collect();
+    let tables_with_pending = tables.iter().filter(|t| t.pending_generations > 0).count();
+    if !query.include_idle {
+        tables.retain(|t| t.pending_generations > 0);
+    }
+    tables.sort_by_key(|t| std::cmp::Reverse(t.pending_generations));
+    tables.truncate(limit);
+    Ok(Json(DemandReport {
+        leader,
+        total_tables,
+        tables_with_pending,
+        tables,
+    }))
+}
+
+/// `GET /api/v1/scheduler/executors` — every live executor heartbeat with
+/// its headroom computed from durable assignments, never from the sampled
+/// free bytes. An executor with assignments but no heartbeat appears as
+/// draining with zero totals.
+pub async fn scheduler_executors(
+    State(state): State<Arc<MasterState>>,
+) -> Result<Json<Vec<crate::executors::Headroom>>, MasterError> {
+    let keys = crate::executors::Keys::new(&state.config.etcd.etcd_prefix);
+    let headroom = crate::executors::load_headroom(state.task_store.etcd_client(), &keys)
+        .await
+        .map_err(MasterError::Internal)?;
+    Ok(Json(headroom.into_values().collect()))
+}
+
 /// `GET /api/v1/scheduler/repairs` — base-table repairs the master performed,
 /// most recent first: which fragments were dropped from which store, when,
 /// and how many rows they held.
@@ -816,6 +960,7 @@ async fn drain_executor(
 pub fn api_router() -> Router<Arc<MasterState>> {
     Router::new()
         .route("/executor", get(executor_status))
+        .route("/merge-retirements", post(crate::legacy_retirement::route))
         .route("/merge-progress", get(merge_progress))
         .route("/executor/drain", post(drain_executor))
         .route("/experiments", get(list_experiments))
@@ -835,6 +980,8 @@ pub fn api_router() -> Router<Arc<MasterState>> {
             post(crate::catchup::trigger).get(crate::catchup::status),
         )
         .route("/scheduler/cooldowns", get(list_cooldowns))
+        .route("/scheduler/demand", get(scheduler_demand))
+        .route("/scheduler/executors", get(scheduler_executors))
         .route("/scheduler/repairs", get(list_repairs))
         .route("/registry/diff", get(registry_diff))
         .route("/registry/backfill", post(registry_backfill))
@@ -898,9 +1045,12 @@ mod tests {
 
     fn test_config(dir: &TempDir) -> MasterConfig {
         MasterConfig {
+            legacy_retirement_request: None,
+            local_merge: Default::default(),
             append: Default::default(),
             catchup: Default::default(),
             wal_tail: Default::default(),
+            planner: Default::default(),
             maintenance: Default::default(),
             merge_rollout: Default::default(),
             data_dir: dir.path().to_string_lossy().to_string(),
@@ -928,6 +1078,8 @@ mod tests {
             worker_endpoints: vec![],
             task_concurrency: 4,
             merge_wal_concurrency: 4,
+            legacy_merge_wait_concurrency: 32,
+            legacy_merge_foreground_secs: 30,
             etcd: lance_context_core::etcd::EtcdConfig {
                 etcd_endpoints: test_etcd_endpoints(),
                 etcd_prefix: format!("/lance-context/test/{}", generate_id()),

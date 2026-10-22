@@ -25,18 +25,20 @@ struct Capabilities {
     idle_timeout_secs: u64,
     progress_protocol: u32,
     owned_targets: Vec<String>,
+    #[serde(default)]
+    fenced_legacy_merges: bool,
+    #[serde(default = "admission_ready_by_default")]
+    merge_admission_ready: bool,
+}
+
+fn admission_ready_by_default() -> bool {
+    true
 }
 
 pub(crate) async fn run_merge_wal(
     state: &Arc<MasterState>,
     claim: &TaskClaim,
 ) -> Result<String, String> {
-    if state.config.worker_endpoints.is_empty()
-        && !(state.config.append.local(&claim.task.target)
-            && state.config.merge_rollout.owned(&claim.task.target))
-    {
-        return Err("no worker endpoints configured".into());
-    }
     let coordinator = state.task_store.merge_coordinator();
     let proof = state.task_store.merge_claim(claim);
     let target = &claim.task.target;
@@ -44,6 +46,9 @@ pub(crate) async fn run_merge_wal(
         // A drain stops new work, but must still resolve an already-owned
         // execution. Otherwise rollback would strand its persistent lock.
         if let Some(old) = coordinator.get(target).await? {
+            let old =
+                crate::legacy_retirement::reconcile_prepared(&state.config, &coordinator, old)
+                    .await?;
             ensure_recovery_due(&coordinator, &old).await?;
             if reconcile(&state.http, &coordinator, &proof, old, false)
                 .await
@@ -56,22 +61,74 @@ pub(crate) async fn run_merge_wal(
         }
         return Err("merge target draining for protocol transition".into());
     }
-    if !state.config.merge_rollout.owned(target) {
-        if coordinator.get(target).await?.is_some() {
-            return Err("owned execution still present; refusing legacy downgrade".into());
-        }
-        return run_legacy(state, target).await;
-    }
-    if state.config.append.enabled(target) {
+    if !state.config.merge_rollout.owned(target) && !state.config.merge_rollout.fence_legacy {
         if let Some(old) = coordinator.get(target).await? {
+            let old =
+                crate::legacy_retirement::reconcile_prepared(&state.config, &coordinator, old)
+                    .await?;
+            // Turning off new admission must never disable recovery of durable
+            // worker records. Observe useful progress before considering cancel.
+            if old.protocol == 0 && old.phase == Phase::Finished {
+                recover_execution(state, &coordinator, &proof, old).await?;
+                return Ok("released acknowledged legacy merge; new pass may be scheduled".into());
+            }
+            if old.maintenance.is_some() || old.protocol != 2 {
+                return Err("owned execution still present; refusing legacy downgrade".into());
+            }
             ensure_recovery_due(&coordinator, &old).await?;
-            recover_execution(state, &coordinator, &proof, old).await?;
+            if reconcile(&state.http, &coordinator, &proof, old, false)
+                .await
+                .is_err()
+            {
+                if let Some(current) = coordinator.get(target).await? {
+                    recover_execution(state, &coordinator, &proof, current).await?;
+                }
+            }
+            return Ok("reconciled recorded worker merge; new fenced admission disabled".into());
+        }
+        return run_legacy(state, claim).await;
+    }
+    if state.config.worker_endpoints.is_empty()
+        && !crate::local_merge::selected(&state.config, target)
+        && coordinator.get(target).await?.is_none()
+    {
+        return Err("no worker endpoints configured".into());
+    }
+    if (state.config.merge_rollout.owned(target) && state.config.append.enabled(target))
+        || crate::local_merge::selected(&state.config, target)
+    {
+        if let Some(old) = coordinator.get(target).await? {
+            let old =
+                crate::legacy_retirement::reconcile_prepared(&state.config, &coordinator, old)
+                    .await?;
+            ensure_recovery_due(&coordinator, &old).await?;
+            if old.maintenance.is_none() {
+                // A newly selected resident target may still have useful
+                // background work. Wait for its real progress and terminal
+                // acknowledgement before considering storage recovery.
+                if reconcile(&state.http, &coordinator, &proof, old, false)
+                    .await
+                    .is_err()
+                {
+                    if let Some(current) = coordinator.get(target).await? {
+                        recover_execution(state, &coordinator, &proof, current).await?;
+                    }
+                }
+            } else {
+                recover_execution(state, &coordinator, &proof, old).await?;
+            }
         }
         return crate::maintenance_execution::run_as(
             state,
             claim,
             lance_context_merge::MaintenanceKind::Catchup,
-            crate::rollout_append::run(state, target),
+            async {
+                if state.config.merge_rollout.owned(target) && state.config.append.enabled(target) {
+                    crate::rollout_append::run(state, target).await
+                } else {
+                    crate::local_merge::run(state, target).await
+                }
+            },
         )
         .await;
     }
@@ -79,10 +136,14 @@ pub(crate) async fn run_merge_wal(
     // after a completed barrier lets healthy shards progress in this task.
     for recovery_round in 0..2 {
         if let Some(old) = coordinator.get(&claim.task.target).await? {
+            let old =
+                crate::legacy_retirement::reconcile_prepared(&state.config, &coordinator, old)
+                    .await?;
             ensure_recovery_due(&coordinator, &old).await?;
             if recovery_round > 0 || matches!(old.phase, Phase::Recovering | Phase::Uncertain) {
                 recover_execution(state, &coordinator, &proof, old).await?;
-            } else if let Err(error) = reconcile(&state.http, &coordinator, &proof, old, true).await
+            } else if let Err(error) =
+                reconcile(&state.http, &coordinator, &proof, old, false).await
             {
                 if let Some(current) = coordinator.get(&claim.task.target).await? {
                     recover_execution(state, &coordinator, &proof, current).await?;
@@ -111,30 +172,220 @@ pub(crate) async fn run_merge_wal(
 
 // Compatibility path is chosen only by explicit configuration, never after a
 // failed owned RPC. It retains legacy limitations until that table is drained.
-async fn run_legacy(state: &Arc<MasterState>, target: &str) -> Result<String, String> {
-    run_legacy_workers(&state.http, &state.config.worker_endpoints, target).await
+async fn run_legacy(state: &Arc<MasterState>, claim: &TaskClaim) -> Result<String, String> {
+    if state.config.worker_endpoints.is_empty() {
+        return Err("no worker endpoints configured".into());
+    }
+    let coordinator = state.task_store.merge_coordinator();
+    let proof = state.task_store.merge_claim(claim);
+    run_legacy_workers_inner(
+        &state.http,
+        &state.config.worker_endpoints,
+        &claim.task.target,
+        LegacyOwnership::Durable {
+            coordinator: &coordinator,
+            proof: &proof,
+        },
+    )
+    .await
 }
 
+// The untracked variant exists only for HTTP classification unit tests. Every
+// production call must carry the canonical claim and durable coordinator.
+enum LegacyOwnership<'a> {
+    Durable {
+        coordinator: &'a Coordinator,
+        proof: &'a ClaimProof,
+    },
+    #[cfg(test)]
+    HttpTest,
+}
+
+impl LegacyOwnership<'_> {
+    async fn unresolved(&self, target: &str) -> Result<bool, String> {
+        match self {
+            Self::Durable { coordinator, .. } => Ok(coordinator.get(target).await?.is_some()),
+            #[cfg(test)]
+            Self::HttpTest => Ok(false),
+        }
+    }
+    /// Mixed-version fleets upgrade one worker at a time. A worker which has
+    /// closed legacy admission must receive a protocol-2 reservation, never a
+    /// protocol-0 record followed by a conflicting background reservation.
+    async fn upgraded_worker(
+        &self,
+        http: &reqwest::Client,
+        target: &str,
+        endpoint: &str,
+    ) -> Result<Option<usize>, String> {
+        match self {
+            Self::Durable { coordinator, proof } => {
+                let caps = match capabilities(http, endpoint).await {
+                    Ok(caps) => caps,
+                    Err(error) => {
+                        coordinator
+                            .record_failure(proof, target, endpoint, &error)
+                            .await?;
+                        return Err(error);
+                    }
+                };
+                if !caps.merge_admission_ready {
+                    let error = "worker admission discovery is still pending; no merge sent";
+                    coordinator
+                        .record_failure(proof, target, endpoint, error)
+                        .await?;
+                    return Err(error.into());
+                }
+                if caps.fenced_legacy_merges {
+                    let before = coordinator
+                        .failure(target, endpoint)
+                        .await?
+                        .map_or(0, |f| f.consecutive_attempts);
+                    let result =
+                        one_with_capabilities(http, coordinator, proof, target, endpoint, caps)
+                            .await;
+                    if let Err(error) = &result {
+                        if coordinator.get(target).await?.is_none()
+                            && coordinator
+                                .failure(target, endpoint)
+                                .await?
+                                .is_none_or(|f| f.consecutive_attempts <= before)
+                        {
+                            coordinator
+                                .record_failure(proof, target, endpoint, error)
+                                .await?;
+                        }
+                    }
+                    result.map(Some)
+                } else {
+                    Ok(None)
+                }
+            }
+            #[cfg(test)]
+            Self::HttpTest => Ok(None),
+        }
+    }
+    async fn admit(&self, target: &str, endpoint: &str) -> Result<Option<Execution>, String> {
+        match self {
+            Self::Durable { coordinator, proof } => coordinator
+                .admit_legacy(proof, target, endpoint)
+                .await
+                .map(Some),
+            #[cfg(test)]
+            Self::HttpTest => Ok(None),
+        }
+    }
+
+    async fn deferred(&self, target: &str, endpoint: &str) -> Result<Option<String>, String> {
+        match self {
+            Self::Durable { coordinator, .. } => Ok(coordinator
+                .failure(target, endpoint)
+                .await?
+                .filter(|failure| failure.next_retry_ms > lance_context_merge::failure::now_ms())
+                .map(|failure| {
+                    format!(
+                        "{endpoint}: retry at {} after {} failed attempts (attention={})",
+                        failure.next_retry_ms,
+                        failure.consecutive_attempts,
+                        failure.needs_attention
+                    )
+                })),
+            #[cfg(test)]
+            Self::HttpTest => Ok(None),
+        }
+    }
+
+    async fn known_outcome(
+        &self,
+        execution: Option<Execution>,
+        outcome: Result<usize, String>,
+    ) -> Result<(), String> {
+        match self {
+            Self::Durable { coordinator, proof } => {
+                let running = execution.ok_or("missing legacy ownership record")?;
+                if !coordinator.finish(&running, outcome.clone()).await? {
+                    return Err(
+                        "legacy completion ownership changed; refusing further admission".into(),
+                    );
+                }
+                if !coordinator
+                    .release(proof, &running.finished(outcome))
+                    .await?
+                {
+                    return Err("claim lost before releasing acknowledged legacy execution".into());
+                }
+                Ok(())
+            }
+            #[cfg(test)]
+            Self::HttpTest => Ok(()),
+        }
+    }
+}
+
+#[cfg(test)]
 async fn run_legacy_workers(
     http: &reqwest::Client,
     endpoints: &[String],
     target: &str,
+) -> Result<String, String> {
+    run_legacy_workers_inner(http, endpoints, target, LegacyOwnership::HttpTest).await
+}
+
+async fn run_legacy_workers_inner(
+    http: &reqwest::Client,
+    endpoints: &[String],
+    target: &str,
+    ownership: LegacyOwnership<'_>,
 ) -> Result<String, String> {
     let mut reclaimed = 0u64;
     let mut completed = 0usize;
     let mut unavailable = Vec::new();
     for endpoint in endpoints {
         let endpoint = endpoint.trim_end_matches('/');
+        if let Some(deferred) = ownership.deferred(target, endpoint).await? {
+            metrics::counter!("master_merge_wal_legacy_deferred_total").increment(1);
+            unavailable.push(deferred);
+            continue;
+        }
+        let started = std::time::Instant::now();
+        match ownership.upgraded_worker(http, target, endpoint).await {
+            Ok(Some(n)) => {
+                metrics::histogram!("master_merge_wal_worker_duration_seconds")
+                    .record(started.elapsed().as_secs_f64());
+                metrics::counter!("master_merge_wal_workers_total", "result" => "ok").increment(1);
+                metrics::counter!("master_merge_wal_generations_reclaimed_total")
+                    .increment(n as u64);
+                reclaimed += n as u64;
+                completed += 1;
+                continue;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                // A failed capability probe must never cause an old-style POST.
+                // A failed owned request may still have a durable execution;
+                // the next canonical pass reconciles it before admitting work.
+                metrics::counter!("master_merge_wal_workers_total", "result" => "failed")
+                    .increment(1);
+                if !ownership.unresolved(target).await? {
+                    unavailable.push(format!("{endpoint}: {error}"));
+                    continue;
+                }
+                return Err(format!("merged {reclaimed} generations across {completed}/{} workers; {endpoint}: {error}", endpoints.len()));
+            }
+        }
         let url = match target.strip_prefix("generic:") {
             Some(name) => format!("{endpoint}/api/v1/generic/{name}/merge-wal"),
             None => format!("{endpoint}/api/v1/internal/merge-wal/{target}"),
         };
+        let execution = ownership.admit(target, endpoint).await?;
         let started = std::time::Instant::now();
-        let result = async {
+        let result = crate::merge_capacity::observe(async {
             let response = http.post(url).send().await.map_err(|error| {
                 // The shared worker client must disable redirects: a failed
                 // connection AFTER a redirected POST could hide an execution.
-                (error.is_connect(), error.to_string())
+                // Keep a table name such as "schema" or "invalid" out of
+                // failure classification; target/endpoint are separate fields.
+                (error.is_connect(), error.without_url().to_string())
             })?;
             if response.status() == reqwest::StatusCode::NOT_FOUND {
                 return Ok(0);
@@ -154,27 +405,38 @@ async fn run_legacy_workers(
             reply["reclaimed"]
                 .as_u64()
                 .ok_or_else(|| (false, "invalid legacy merge response".to_string()))
-        }
+        })
         .await;
         metrics::histogram!("master_merge_wal_worker_duration_seconds")
             .record(started.elapsed().as_secs_f64());
         metrics::counter!("master_merge_wal_workers_total", "result" => if result.is_ok() { "ok" } else { "failed" }).increment(1);
         match result {
             Ok(n) => {
+                ownership.known_outcome(execution, Ok(n as usize)).await?;
                 completed += 1;
                 reclaimed += n;
                 // Preserve real progress even when a later worker is unavailable.
                 metrics::counter!("master_merge_wal_generations_reclaimed_total").increment(n);
             }
             Err((true, error)) => {
+                // Redirects are disabled; this connection never admitted work.
+                // Persist failure accounting in the same transaction that
+                // releases this proven-unadmitted execution. A new task or
+                // master must not reset the endpoint's attempt count.
+                ownership
+                    .known_outcome(execution, Err(error.clone()))
+                    .await?;
                 tracing::warn!(%endpoint, %target, %error, "worker connection failed before merge admission; continuing healthy workers");
                 unavailable.push(format!("{endpoint}: {error}"));
             }
             Err((false, error)) => {
                 // A response error, reset, or timeout after sending may leave
                 // an unfenced legacy writer alive. Do not advance the fan-out.
+                // Fetch evidence from the same worker without opening stores or
+                // querying etcd. This never permits retry, takeover or restart.
+                let progress = legacy_progress(http, endpoint, target).await;
                 return Err(format!(
-                    "merged {reclaimed} generations across {completed}/{} workers (legacy); stopped at {endpoint}: {error}",
+                    "merged {reclaimed} generations across {completed}/{} workers (legacy); stopped at {endpoint}: {error}; legacy progress: {progress}",
                     endpoints.len()
                 ));
             }
@@ -192,6 +454,67 @@ async fn run_legacy_workers(
             "{detail}; unavailable workers: {}",
             unavailable.join("; ")
         ))
+    }
+}
+
+async fn legacy_progress(http: &reqwest::Client, endpoint: &str, target: &str) -> String {
+    let result =
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut response = http
+                .get(format!("{endpoint}/api/v1/internal/legacy-merges"))
+                .query(&[("target", target)])
+                .send()
+                .await
+                .map_err(|e| e.to_string())?
+                .error_for_status()
+                .map_err(|e| e.to_string())?;
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+                if bytes.len().saturating_add(chunk.len()) > 64 * 1024 {
+                    return Err("snapshot exceeds 64 KiB".to_string());
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            if value["instance"].as_str().is_none()
+                || value["snapshot"]["protocol"] != 1
+                || value["snapshot"]["takeover_authorized"] != false
+            {
+                return Err("unsupported progress response".to_string());
+            }
+            let snapshot = &value["snapshot"];
+            let executions = snapshot["executions"]
+                .as_array()
+                .ok_or_else(|| "missing execution observations".to_string())?;
+            // Task errors are stored in etcd. Keep the durable summary small even
+            // if the endpoint returns a large history or an unexpected field.
+            let summaries: Vec<_> = executions.iter().take(8).map(|row| serde_json::json!({
+            "id": row["id"].as_str().map(|s| s.chars().take(128).collect::<String>()),
+            "phase": row["phase"].as_str().map(|s| s.chars().take(32).collect::<String>()),
+            "elapsed_ms": row["elapsed_ms"].as_u64(),
+            "completed_steps": row["completed_steps"].as_u64(),
+            "base_commits": row["work"]["base_commits"].as_u64(),
+            "generations_reclaimed": row["work"]["generations_reclaimed"].as_u64(),
+            "wal_decoded_bytes": row["work"]["wal_decoded_bytes"].as_u64(),
+            "encoded_bytes": row["work"]["encoded_bytes"].as_u64(),
+            "active_commits": row["writes"]["active_commits"].as_u64(),
+            "uncertain_commit": row["writes"]["uncertain_commit"].as_bool(),
+        })).collect();
+            Ok(serde_json::json!({
+            "instance": value["instance"].as_str().unwrap().chars().take(128).collect::<String>(),
+            "takeover_authorized": false,
+            "untracked_admissions": snapshot["untracked_admissions"].as_u64(),
+            "evicted_history": snapshot["evicted_history"].as_u64(),
+            "truncated": executions.len() > 8 || snapshot["truncated"].as_bool() != Some(false),
+            "executions": summaries,
+        }).to_string())
+        })
+        .await;
+    match result {
+        Ok(Ok(snapshot)) => snapshot,
+        Ok(Err(error)) => format!("unavailable ({error}); ownership unresolved"),
+        Err(_) => "unavailable (observation timed out); ownership unresolved".into(),
     }
 }
 
@@ -303,6 +626,9 @@ async fn run_workers(
     target: &str,
     endpoints: &[String],
 ) -> Result<String, String> {
+    if endpoints.is_empty() {
+        return Err("no worker endpoints configured after reconciling recorded execution".into());
+    }
     let mut pending = Vec::new();
     let mut deferred = Vec::new();
     for endpoint in endpoints {
@@ -394,12 +720,16 @@ async fn one(
     target: &str,
     endpoint: &str,
 ) -> Result<usize, String> {
+    let capabilities = capabilities(http, endpoint).await?;
+    one_with_capabilities(http, coordinator, proof, target, endpoint, capabilities).await
+}
+
+async fn capabilities(http: &reqwest::Client, endpoint: &str) -> Result<Capabilities, String> {
     let base = format!(
         "{}/api/v1/internal/merge-executor",
         endpoint.trim_end_matches('/')
     );
-    let capabilities: Capabilities = http
-        .get(&base)
+    http.get(&base)
         .timeout(RPC_TIMEOUT)
         .send()
         .await
@@ -408,10 +738,26 @@ async fn one(
         .map_err(|e| e.to_string())?
         .json()
         .await
-        .map_err(|e| e.to_string())?;
-    if capabilities.protocol != 2
+        .map_err(|e| e.to_string())
+}
+
+async fn one_with_capabilities(
+    http: &reqwest::Client,
+    coordinator: &Coordinator,
+    proof: &ClaimProof,
+    target: &str,
+    endpoint: &str,
+    capabilities: Capabilities,
+) -> Result<usize, String> {
+    let base = format!(
+        "{}/api/v1/internal/merge-executor",
+        endpoint.trim_end_matches('/')
+    );
+    if !capabilities.merge_admission_ready
+        || capabilities.protocol != 2
         || capabilities.progress_protocol != 1
-        || !capabilities.owned_targets.iter().any(|t| t == target)
+        || (!capabilities.owned_targets.iter().any(|t| t == target)
+            && !capabilities.fenced_legacy_merges)
         || capabilities.timeout_secs == 0
         || capabilities.queue_timeout_secs == 0
         || capabilities.idle_timeout_secs == 0
@@ -478,6 +824,9 @@ async fn reconcile_with_grace(
     cancel_immediately: bool,
     grace: Duration,
 ) -> Result<usize, String> {
+    if initial.protocol != 2 {
+        return Err("legacy merge ownership unresolved; terminal acknowledgement or verified retirement required".into());
+    }
     let mut deadlines = Deadlines::new(&initial, tokio::time::Instant::now());
     let mut cancel_started = cancel_immediately.then(tokio::time::Instant::now);
     let mut next_cancel = tokio::time::Instant::now();
@@ -744,6 +1093,139 @@ mod tests {
             .await
             .unwrap();
         (Coordinator::new(client, prefix), proof)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn legacy_retirement_mixed_fleet_uses_owned_protocol_without_legacy_reservation() {
+        let (coordinator, proof) = fixture().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let c = coordinator.clone();
+        let fenced = Router::new().route("/api/v1/internal/merge-executor", get(|| async {
+            Json(serde_json::json!({"protocol":2,"instance":"new","timeout_secs":600,"queue_timeout_secs":600,
+                "idle_timeout_secs":600,"progress_protocol":1,"owned_targets":[],"fenced_legacy_merges":true,"merge_admission_ready":true}))
+        })).route("/api/v1/internal/merge-executor/start", post(move |Json(e): Json<Execution>| {
+            let c = c.clone(); let calls = counted.clone();
+            async move {
+                assert_eq!(e.protocol, 2);
+                let running = c.start(&e).await.unwrap().unwrap();
+                calls.fetch_add(1, Ordering::SeqCst);
+                assert!(c.finish(&running, Ok(7)).await.unwrap());
+                axum::http::StatusCode::ACCEPTED
+            }
+        })).fallback(post(|| async { panic!("fenced worker must never receive a legacy POST"); #[allow(unreachable_code)] axum::http::StatusCode::INTERNAL_SERVER_ERROR }));
+        let legacy = Router::new().route("/api/v1/internal/merge-executor", get(|| async {
+            Json(serde_json::json!({"protocol":2,"instance":"old","timeout_secs":600,"queue_timeout_secs":600,
+                "idle_timeout_secs":600,"progress_protocol":1,"owned_targets":[]}))
+        })).fallback(post(|| async { Json(serde_json::json!({"reclaimed":3})) }));
+        let mut endpoints = Vec::new();
+        let mut servers = Vec::new();
+        for app in [fenced, legacy] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            endpoints.push(format!("http://{}", listener.local_addr().unwrap()));
+            servers.push(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            }));
+        }
+        let result = super::run_legacy_workers_inner(
+            &reqwest::Client::new(),
+            &endpoints,
+            "table",
+            super::LegacyOwnership::Durable {
+                coordinator: &coordinator,
+                proof: &proof,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.contains("merged 10 generations across 2/2"),
+            "{result}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(coordinator.get("table").await.unwrap().is_none());
+        for server in servers {
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn legacy_retirement_unresolved_worker_mode_never_admits_legacy() {
+        let (coordinator, proof) = fixture().await;
+        let app = Router::new().route("/api/v1/internal/merge-executor", get(|| async {
+            Json(serde_json::json!({"protocol":2,"instance":"new","timeout_secs":600,"queue_timeout_secs":600,
+                "idle_timeout_secs":600,"progress_protocol":1,"owned_targets":[],"fenced_legacy_merges":false,"merge_admission_ready":false}))
+        })).fallback(post(|| async { panic!("unknown mode must not admit any POST"); #[allow(unreachable_code)] axum::http::StatusCode::INTERNAL_SERVER_ERROR }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let error = super::run_legacy_workers_inner(
+            &reqwest::Client::new(),
+            &[endpoint],
+            "table",
+            super::LegacyOwnership::Durable {
+                coordinator: &coordinator,
+                proof: &proof,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("discovery is still pending"));
+        assert!(coordinator.get("table").await.unwrap().is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn append_wildcard_does_not_adopt_new_tables_before_native_routing() {
+        use clap::Parser;
+        use lance_context_api::TaskKind;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::MasterConfig::parse_from(["test"]);
+        cfg.data_dir = dir.path().to_string_lossy().into();
+        cfg.etcd.etcd_endpoints = vec![std::env::var("ETCD_TEST_ENDPOINTS").unwrap()];
+        cfg.etcd.etcd_prefix = format!(
+            "/merge-fenced-routing/{}",
+            lance_context_core::generate_id()
+        );
+        cfg.merge_rollout.fence_legacy = true;
+        cfg.append.rollout_append_targets = vec!["*".into()];
+        assert!(cfg.merge_rollout.owned_targets.is_empty());
+        assert!(!crate::local_merge::selected(&cfg, "table"));
+        let mut state = MasterState::new(cfg).await.unwrap();
+        let coordinator = state.task_store.merge_coordinator();
+        let good = Worker {
+            coordinator: coordinator.clone(),
+            calls: Arc::new(AtomicUsize::new(0)),
+            fail: false,
+            stall_first: false,
+            name: "fenced-worker",
+            events: Arc::new(Mutex::new(Vec::new())),
+        };
+        let (endpoint, server) = worker(good.clone()).await;
+        Arc::get_mut(&mut state).unwrap().config.worker_endpoints = vec![endpoint];
+        state
+            .task_store
+            .enqueue(TaskKind::MergeWal, "table", Vec::new())
+            .await
+            .unwrap();
+        let claim = state
+            .task_store
+            .claim_next_of_kinds(crate::task_store::TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let outcome = run_merge_wal(&state, &claim).await;
+        server.abort();
+        assert!(outcome.as_ref().unwrap().contains("merged 7 generations"));
+        assert_eq!(good.calls.load(Ordering::SeqCst), 1);
+        assert!(coordinator.get("table").await.unwrap().is_none());
+        state.task_store.finish(claim, outcome).await.unwrap();
     }
 
     #[tokio::test]
@@ -1173,7 +1655,345 @@ mod legacy_connection_tests {
         Arc,
     };
 
+    async fn durable_store() -> (tempfile::TempDir, crate::task_store::TaskStore, String) {
+        use clap::Parser;
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        assert!(
+            endpoint.starts_with("http://127.0.0.1:") || endpoint.starts_with("http://localhost:")
+        );
+        let mut cfg = crate::config::MasterConfig::parse_from(["test"]);
+        cfg.data_dir = dir.path().to_string_lossy().into();
+        cfg.etcd.etcd_endpoints = vec![endpoint];
+        cfg.etcd.etcd_prefix = format!(
+            "/legacy-ownership-tests/{}",
+            lance_context_core::generate_id()
+        );
+        let store = crate::task_store::TaskStore::open(&cfg).await.unwrap();
+        (dir, store, cfg.etcd.etcd_prefix)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn legacy_timeout_retains_ownership_after_task_finish_and_blocks_replay() {
+        use super::{run_legacy_workers_inner, LegacyOwnership};
+        use crate::task_store::TaskKinds;
+        use lance_context_api::TaskKind;
+        let (_dir, store, prefix) = durable_store().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let barrier = release.clone();
+        let (endpoint, server) = serve(Router::new().fallback(post(move || {
+            let observed = observed.clone();
+            let barrier = barrier.clone();
+            async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                barrier.notified().await;
+                Json(serde_json::json!({"reclaimed": 3}))
+            }
+        })))
+        .await;
+        store
+            .enqueue(TaskKind::MergeWal, "table", vec![])
+            .await
+            .unwrap();
+        let claim = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let coordinator = store.merge_coordinator();
+        let proof = store.merge_claim(&claim);
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let outcome = run_legacy_workers_inner(
+            &http,
+            std::slice::from_ref(&endpoint),
+            "table",
+            LegacyOwnership::Durable {
+                coordinator: &coordinator,
+                proof: &proof,
+            },
+        )
+        .await;
+        assert!(outcome.as_ref().unwrap_err().contains("stopped at"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let running = coordinator.get("table").await.unwrap().unwrap();
+        assert_eq!(running.protocol, 0);
+        assert_eq!(running.phase, lance_context_merge::Phase::Running);
+        store.finish(claim, outcome).await.unwrap();
+        let lock = store
+            .etcd_client()
+            .clone()
+            .get(lance_context_merge::target_lock_key(&prefix, "table"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            lock.kvs()[0].lease(),
+            0,
+            "ambiguous writer protection must outlive task lease"
+        );
+        assert_eq!(
+            lock.kvs()[0].value(),
+            lance_context_merge::execution_owner(&running).as_bytes()
+        );
+        store
+            .enqueue(TaskKind::MergeWal, "table", vec![])
+            .await
+            .unwrap();
+        let retry = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let retry_proof = store.merge_claim(&retry);
+        let retry_result = run_legacy_workers_inner(
+            &http,
+            &[endpoint],
+            "table",
+            LegacyOwnership::Durable {
+                coordinator: &coordinator,
+                proof: &retry_proof,
+            },
+        )
+        .await;
+        assert!(retry_result
+            .unwrap_err()
+            .contains("execution already present"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "reconciler claim cannot POST another writer"
+        );
+        assert!(
+            coordinator.freeze(&retry_proof, &running).await.is_err(),
+            "protocol 2 barriers cannot retire legacy work"
+        );
+        store
+            .finish(retry, Err("legacy ownership unresolved".into()))
+            .await
+            .unwrap();
+        assert_eq!(coordinator.get("table").await.unwrap(), Some(running));
+        release.notify_one();
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn legacy_connection_budget_survives_new_tasks_without_blocking_healthy_workers() {
+        use super::{run_legacy_workers_inner, LegacyOwnership};
+        use crate::task_store::{TaskKinds, TaskStore};
+        use lance_context_api::TaskKind;
+
+        const TARGET: &str = "schema_invalid_protocol_probe";
+
+        async fn pass(store: &TaskStore, endpoints: &[String]) -> String {
+            store
+                .enqueue(TaskKind::MergeWal, TARGET, vec![])
+                .await
+                .unwrap();
+            let claim = store
+                .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+                .await
+                .unwrap()
+                .unwrap();
+            let coordinator = store.merge_coordinator();
+            let proof = store.merge_claim(&claim);
+            let outcome = run_legacy_workers_inner(
+                &crate::state::worker_http_client().unwrap(),
+                endpoints,
+                TARGET,
+                LegacyOwnership::Durable {
+                    coordinator: &coordinator,
+                    proof: &proof,
+                },
+            )
+            .await;
+            let error = outcome.as_ref().unwrap_err().clone();
+            assert!(
+                coordinator.get(TARGET).await.unwrap().is_none(),
+                "only proven-unadmitted failures may release ownership"
+            );
+            store.finish(claim, outcome).await.unwrap();
+            error
+        }
+        let (_dir, store, _) = durable_store().await;
+        // The port stays reserved and never listens: every real attempt is a
+        // definite pre-admission failure, not a lost response from a writer.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let bad = format!("http://{}", socket.local_addr().unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (good, server) = healthy(calls.clone()).await;
+        let endpoints = [bad.clone(), good.clone()];
+        let coordinator = store.merge_coordinator();
+        assert!(pass(&store, &endpoints)
+            .await
+            .contains("merged 7 generations"));
+        let first = coordinator.failure(TARGET, &bad).await.unwrap().unwrap();
+        assert_eq!(first.consecutive_attempts, 1);
+        assert_eq!(
+            first.class,
+            lance_context_merge::failure::FailureClass::Retryable,
+            "target names must not turn connection failures into permanent configuration errors"
+        );
+        let second = pass(&store, &endpoints).await;
+        assert!(second.contains("retry at"));
+        assert!(second.contains("merged 7 generations"));
+        let skipped = coordinator.failure(TARGET, &bad).await.unwrap().unwrap();
+        assert_eq!(skipped.consecutive_attempts, 1);
+        assert_eq!(
+            skipped.last_failure_ms, first.last_failure_ms,
+            "a skipped endpoint cannot be charged another actual failure"
+        );
+        for expected in 2..=3 {
+            let failure = coordinator.failure(TARGET, &bad).await.unwrap().unwrap();
+            let delay = failure
+                .next_retry_ms
+                .saturating_sub(lance_context_merge::failure::now_ms());
+            assert!(
+                delay <= 2500,
+                "only the first two short retry windows are awaited"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(delay + 10)).await;
+            assert!(pass(&store, &endpoints)
+                .await
+                .contains("merged 7 generations"));
+            let current = coordinator.failure(TARGET, &bad).await.unwrap().unwrap();
+            assert_eq!(
+                current.consecutive_attempts, expected,
+                "fresh task completion must not reset the unavailable endpoint's budget"
+            );
+        }
+        let exhausted = coordinator.failure(TARGET, &bad).await.unwrap().unwrap();
+        assert!(
+            !exhausted.needs_attention,
+            "reuse the existing transient-failure policy"
+        );
+        assert!(exhausted.next_retry_ms - exhausted.last_failure_ms >= 30000);
+        assert!(pass(&store, &endpoints).await.contains("retry at"));
+        assert_eq!(
+            coordinator
+                .failure(TARGET, &bad)
+                .await
+                .unwrap()
+                .unwrap()
+                .consecutive_attempts,
+            3
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            5,
+            "every pass must still advance the healthy worker"
+        );
+        assert!(coordinator.failure(TARGET, &good).await.unwrap().is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn legacy_success_releases_each_endpoint_and_task_lock() {
+        use super::{run_legacy_workers_inner, LegacyOwnership};
+        use crate::task_store::TaskKinds;
+        use lance_context_api::TaskKind;
+        let (_dir, store, prefix) = durable_store().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (endpoint, server) = healthy(calls.clone()).await;
+        store
+            .enqueue(TaskKind::MergeWal, "table", vec![])
+            .await
+            .unwrap();
+        let claim = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let coordinator = store.merge_coordinator();
+        let proof = store.merge_claim(&claim);
+        let result = run_legacy_workers_inner(
+            &crate::state::worker_http_client().unwrap(),
+            &[endpoint.clone(), endpoint],
+            "table",
+            LegacyOwnership::Durable {
+                coordinator: &coordinator,
+                proof: &proof,
+            },
+        )
+        .await;
+        assert!(result.as_ref().unwrap().contains("merged 14 generations"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(coordinator.get("table").await.unwrap().is_none());
+        store.finish(claim, result).await.unwrap();
+        assert!(store
+            .etcd_client()
+            .clone()
+            .get(lance_context_merge::target_lock_key(&prefix, "table"), None)
+            .await
+            .unwrap()
+            .kvs()
+            .is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn legacy_admission_survives_claim_lease_loss_before_http() {
+        use crate::task_store::TaskKinds;
+        use lance_context_api::TaskKind;
+        let (_dir, store, prefix) = durable_store().await;
+        store
+            .enqueue(TaskKind::MergeWal, "table", vec![])
+            .await
+            .unwrap();
+        let claim = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let proof = store.merge_claim(&claim);
+        let coordinator = store.merge_coordinator();
+        let running = coordinator
+            .admit_legacy(&proof, "table", "http://uncontacted-worker")
+            .await
+            .unwrap();
+        store
+            .etcd_client()
+            .clone()
+            .lease_revoke(proof.lease_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            coordinator.get("table").await.unwrap(),
+            Some(running.clone())
+        );
+        assert!(!coordinator.cancel_reserved(&running).await.unwrap());
+        assert!(coordinator.freeze(&proof, &running).await.is_err());
+        let lock = store
+            .etcd_client()
+            .clone()
+            .get(lance_context_merge::target_lock_key(&prefix, "table"), None)
+            .await
+            .unwrap();
+        assert_eq!(lock.kvs()[0].lease(), 0);
+        assert_eq!(
+            lock.kvs()[0].value(),
+            lance_context_merge::execution_owner(&running).as_bytes()
+        );
+        assert!(coordinator
+            .admit_legacy(&proof, "other", "http://uncontacted-worker")
+            .await
+            .is_err());
+    }
+
     async fn serve(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let app = app.route("/api/v1/internal/merge-executor", axum::routing::get(|| async {
+            Json(serde_json::json!({"protocol":2,"instance":"legacy-test","timeout_secs":600,
+                "queue_timeout_secs":600,"idle_timeout_secs":600,"progress_protocol":1,"owned_targets":[]}))
+        }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -1189,6 +2009,46 @@ mod legacy_connection_tests {
             }
         })))
         .await
+    }
+
+    #[tokio::test]
+    async fn progress_evidence_is_reported_but_never_allows_unsafe_fanout() {
+        let (bad, failed_server) = serve(Router::new()
+            .route("/api/v1/internal/legacy-merges", axum::routing::get(
+                |axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>| async move {
+                    assert_eq!(query.get("target").unwrap(), "table");
+                    Json(serde_json::json!({"instance":"boot-1", "snapshot":{
+                        "protocol":1, "takeover_authorized":false,
+                        "executions":[{"id":"exec-1","completed_steps":42,"writes":{"active_commits":1}}]
+                    }}))
+                }))
+            .fallback(post(|| async { StatusCode::INTERNAL_SERVER_ERROR }))).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (good, server) = healthy(calls.clone()).await;
+        let http = crate::state::worker_http_client().unwrap();
+        let error = run_legacy_workers(&http, &[bad, good], "table")
+            .await
+            .unwrap_err();
+        assert!(error.contains("exec-1"), "{error}");
+        assert!(error.contains("active_commits"), "{error}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        failed_server.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn oversized_progress_is_bounded_and_not_accepted_as_handoff_evidence() {
+        let (endpoint, server) =
+            serve(Router::new().fallback(axum::routing::get(|| async { "x".repeat(65537) }))).await;
+        let evidence = super::legacy_progress(
+            &crate::state::worker_http_client().unwrap(),
+            &endpoint,
+            "table",
+        )
+        .await;
+        assert!(evidence.contains("exceeds 64 KiB"), "{evidence}");
+        assert!(evidence.contains("ownership unresolved"));
+        server.abort();
     }
 
     #[tokio::test]

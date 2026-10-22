@@ -1,7 +1,10 @@
+#![recursion_limit = "256"]
+
 mod body_timeout;
 mod config;
 mod drain;
 mod error;
+mod legacy_merge;
 mod merge_execution;
 mod routes;
 mod state;
@@ -47,6 +50,9 @@ async fn main() {
         }
     };
 
+    // Resolve persisted merge protocol independently of startup and ingestion.
+    merge_execution::Executions::resolve_mode_in_background(state.clone());
+
     // Single process-wide WAL-cleanup sweeper (replaces one timer per store).
     // The handle is detached: it runs for the server's lifetime and stops when
     // the last `Arc<AppState>` is dropped.
@@ -73,6 +79,8 @@ async fn main() {
 
     // Install the Prometheus recorder once, before any metrics are emitted.
     let metrics_handle = lance_context_metrics::install_recorder();
+    #[cfg(feature = "lance-io-metrics")]
+    lance_context_core::metrics::describe_lance_io_metrics();
 
     let app = routes::router()
         .with_state(state.clone())

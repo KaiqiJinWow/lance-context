@@ -120,8 +120,9 @@ prefix queue keys with `{class:1}` so lexicographic order is class‑then‑time
 The only write‑side signal today is read‑side: 503 at 4096 pending generations, warn at
 256. Every mature LSM (RocksDB write stall, TiKV `soft-pending-compaction-bytes-limit`,
 ClickHouse `parts_to_delay_insert`, Pebble L0 sublevels) throttles *proportionally* before
-rejecting. **Fix**: Design §4.7 `backlog_class` driving flush‑interval stretch /
-generation coalescing in the rollout server.
+rejecting. **Fix**: Design §4.7 `backlog_class` driving proportional admission delay in
+the rollout server. Not flush‑interval stretching: that converts backlog into memtable
+memory and longer un‑flushed windows, which the memory budget and durability bound forbid.
 
 ### C7. Assignments without executor liveness
 Today a claim is leased by the *claimer*, but nothing verifies the claimer can actually run
@@ -220,8 +221,9 @@ planner extracted as pure functions (§4 P0.1), reviews become tractable.
 
 ## 6. Open questions to answer before P1
 
-1. Actual table count and hot‑table fraction in production (sets `max_placements_per_cycle`
-   and whether a 1 s cycle is even needed).
+1. ~~Actual table count and hot‑table fraction in production~~ **Answered (review round
+   5): 13,405 tables, ~354 with pending WAL at a sample, 318 generic.** The design's
+   original "tens to hundreds" assumption was wrong; see #364 for what that broke.
 2. Real generation size distribution (bytes/rows) — drives `expected_bytes` estimates.
 3. p99 compaction and index‑build duration on the largest tables — drives `Deadline`
    thresholds and whether K8s Jobs remain necessary at all.

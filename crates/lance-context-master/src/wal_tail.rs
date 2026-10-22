@@ -38,7 +38,7 @@ struct Cursor {
 fn enabled(config: &MasterConfig) -> bool {
     config.wal_tail.wal_tail_interval_secs > 0
         && config.merge_wal_interval_secs > 0
-        && (!config.worker_endpoints.is_empty() || config.append.rollout_append_local)
+        && (!config.worker_endpoints.is_empty() || crate::local_merge::enabled(config))
         && config.wal_tail.wal_tail_stats_max_age_secs > 0
 }
 
@@ -58,7 +58,7 @@ fn candidates(
                 && now.saturating_sub(row.scanned_at) <= age
                 && !config.merge_rollout.draining(&row.name)
                 && (!config.worker_endpoints.is_empty()
-                    || (config.append.local(&row.name) && config.merge_rollout.owned(&row.name)))
+                    || crate::local_merge::selected(config, &row.name))
                 && after.is_none_or(|after| row.name.as_str() > after)
         })
         .map(|row| row.name.clone())
@@ -92,7 +92,7 @@ async fn tick(state: &Arc<MasterState>, now: i64) -> Result<usize, String> {
     if !enabled(&state.config) {
         return Ok(0);
     }
-    let Some(_operation) = state.admission.try_admit() else {
+    let Some(_operation) = state.admission.try_admit_named("wal_tail") else {
         return Ok(0);
     };
     let key = format!(

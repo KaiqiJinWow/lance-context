@@ -6,6 +6,10 @@ use clap::Parser;
 #[derive(Debug, Clone, Parser)]
 #[command(name = "lance-context-master", version)]
 pub struct MasterConfig {
+    /// Run one identity-verified legacy retirement request from JSON and exit.
+    /// Uses the existing master's service account; starts no scheduler or scans.
+    #[arg(long)]
+    pub legacy_retirement_request: Option<std::path::PathBuf>,
     #[command(flatten)]
     pub merge_rollout: lance_context_merge::rollout::MergeRollout,
     #[command(flatten)]
@@ -15,7 +19,11 @@ pub struct MasterConfig {
     #[command(flatten)]
     pub append: crate::rollout_append::AppendConfig,
     #[command(flatten)]
+    pub local_merge: crate::local_merge::LocalMergeConfig,
+    #[command(flatten)]
     pub wal_tail: crate::wal_tail::WalTailConfig,
+    #[command(flatten)]
+    pub planner: crate::planner::PlannerConfig,
     /// Data directory / object-store prefix shared with the data-plane server.
     #[arg(long, env = "DATA_DIR", default_value = "./data")]
     pub data_dir: String,
@@ -199,6 +207,15 @@ pub struct MasterConfig {
     #[arg(long, env = "MERGE_WAL_CONCURRENCY", default_value_t = 4)]
     pub merge_wal_concurrency: usize,
 
+    /// Additional legacy HTTP waits allowed outside the scheduler execution
+    /// slots. Zero disables yielding. Requests/tasks/claims stay alive.
+    #[arg(long, env = "LEGACY_MERGE_WAIT_CONCURRENCY", default_value_t = 32)]
+    pub legacy_merge_wait_concurrency: usize,
+
+    /// Scheduler observation interval, not a worker execution timeout.
+    #[arg(long, env = "LEGACY_MERGE_FOREGROUND_SECS", default_value_t = 30)]
+    pub legacy_merge_foreground_secs: u64,
+
     /// etcd connection. Scheduler state (task queue, lease-based claims,
     /// per-experiment write locks) lives in etcd so several stateless master
     /// replicas can share one queue. `ETCD_ENDPOINTS` is required.
@@ -317,11 +334,58 @@ mod tests {
         assert_eq!(config.compaction_max_source_fragments, 32);
         assert_eq!(config.compaction_max_bytes_per_file, 1024 * 1024 * 1024);
     }
+
+    #[test]
+    fn wal_claims_default_on_and_can_be_explicitly_disabled() {
+        let default = MasterConfig::try_parse_from(["lance-context-master"]).unwrap();
+        assert!(default.maintenance.claim_wal_merges);
+        assert!(MaintenanceConfig::default().claim_wal_merges);
+        let disabled =
+            MasterConfig::try_parse_from(["lance-context-master", "--claim-wal-merges=false"])
+                .unwrap();
+        assert!(!disabled.maintenance.claim_wal_merges);
+    }
+
+    #[test]
+    fn wal_claim_targets_are_exact_and_do_not_enable_native_ownership() {
+        let default = MasterConfig::try_parse_from(["lance-context-master"]).unwrap();
+        assert!(default.maintenance.wal_claim_targets.is_empty());
+        let selected = MasterConfig::try_parse_from([
+            "lance-context-master",
+            "--wal-claim-targets=hot,generic:events",
+        ])
+        .unwrap();
+        assert_eq!(
+            selected.maintenance.wal_claim_targets,
+            ["hot", "generic:events"]
+        );
+        assert!(!selected.merge_rollout.owned("hot"));
+        assert!(!crate::local_merge::selected(&selected, "hot"));
+        for invalid in ["--wal-claim-targets=", "--wal-claim-targets=*"] {
+            assert!(MasterConfig::try_parse_from(["lance-context-master", invalid]).is_err());
+        }
+    }
 }
 
-/// Deadlines for local table mutations on explicitly owned targets.
+/// Admission and progress deadlines for local master table mutations.
 #[derive(Debug, Clone, clap::Args)]
 pub struct MaintenanceConfig {
+    /// Allow this master's scheduler to claim queued MergeWal tasks. Set false
+    /// for maintenance-only executors; Compact, IndexId and Repair still run.
+    /// This is independent of enqueue intervals and concurrency budgets, and
+    /// is not a runtime drain or proof that a predecessor's writes have ended.
+    #[arg(long, env = "MASTER_CLAIM_WAL_MERGES", default_value_t = true, action = clap::ArgAction::Set)]
+    pub claim_wal_merges: bool,
+    /// Restrict this master's WAL task claims to these exact table names.
+    /// Empty (unset) accepts all targets. This does not select an execution
+    /// protocol, grant ownership, cancel existing work, or restrict maintenance.
+    #[arg(long, env = "MASTER_WAL_CLAIM_TARGETS", value_delimiter = ',', value_parser = parse_wal_claim_target)]
+    pub wal_claim_targets: Vec<String>,
+    /// Fence new master compact/index/repair executions even for rollout and
+    /// generic targets still using legacy worker merges. This does not migrate
+    /// worker admission or retroactively fence pre-upgrade writes.
+    #[arg(long, env = "MASTER_FENCE_LEGACY_MAINTENANCE", default_value_t = false)]
+    pub fence_legacy_maintenance: bool,
     /// Prepare rollout compaction files without holding the table write lock.
     /// Explicit rollout targets or '*'; empty keeps legacy behavior. Updates to
     /// source fragments invalidate preparation instead of being overwritten.
@@ -358,6 +422,9 @@ pub struct MaintenanceConfig {
 impl Default for MaintenanceConfig {
     fn default() -> Self {
         Self {
+            claim_wal_merges: true,
+            wal_claim_targets: Vec::new(),
+            fence_legacy_maintenance: false,
             compaction_prepare_targets: Vec::new(),
             index_prepare_targets: Vec::new(),
             maintenance_catchup_targets: Vec::new(),
@@ -368,4 +435,11 @@ impl Default for MaintenanceConfig {
             maintenance_drain_timeout_secs: 30,
         }
     }
+}
+
+fn parse_wal_claim_target(value: &str) -> Result<String, String> {
+    if value.trim().is_empty() || value == "*" {
+        return Err("WAL claim targets must be nonempty exact table names; omit the option to accept all tables".into());
+    }
+    Ok(value.to_owned())
 }

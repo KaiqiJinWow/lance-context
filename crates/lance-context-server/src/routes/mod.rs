@@ -19,8 +19,16 @@ use crate::state::AppState;
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route(
+            "/api/v1/internal/legacy-merges",
+            get(crate::legacy_merge::status),
+        )
+        .route(
             "/api/v1/internal/merge-executor",
             get(crate::merge_execution::capabilities),
+        )
+        .route(
+            "/api/v1/internal/merge-executor/retirement",
+            get(crate::merge_execution::retirement_status),
         )
         .route(
             "/api/v1/internal/merge-executor/start",

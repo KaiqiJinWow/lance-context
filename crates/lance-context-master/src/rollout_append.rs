@@ -114,7 +114,7 @@ impl AppendConfig {
                 .iter()
                 .any(|t| t == "*" || t == target)
     }
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if !(1..=32).contains(&self.rollout_append_concurrency)
             || !(1..=256).contains(&self.rollout_append_max_generations)
             || self.rollout_append_max_bytes == 0
@@ -222,7 +222,8 @@ pub(crate) async fn run(state: &Arc<MasterState>, target: &str) -> Result<String
     // an older worker and silently fall back to its manifest-publishing merge.
     // Local execution is explicitly configured, never a fallback after failed
     // worker RPCs. Stable shard identities include historical, absent workers.
-    let local_execution = state.config.catchup.target.is_some() || config.local(target);
+    let local_execution = state.config.catchup.target.is_some()
+        || crate::local_merge::selected(&state.config, target);
     let probe_futures: Vec<_> = state
         .config
         .worker_endpoints
@@ -309,7 +310,8 @@ pub(crate) async fn run(state: &Arc<MasterState>, target: &str) -> Result<String
             return Ok(format!("staged append reclaimed {total} generations"));
         }
     }
-    if state.config.append.local(target) && state.config.catchup.target.is_none() {
+    if crate::local_merge::selected(&state.config, target) && state.config.catchup.target.is_none()
+    {
         // Publish before this task releases its claim. The demand consumer only
         // acknowledges a queued successor, never this still-running task. A
         // crash before publication is covered by resident manifest discovery.
@@ -626,6 +628,68 @@ mod tests {
                     format!("{target}-{id}")
                 );
             }
+            // The release published merged watermarks for both shards in
+            // the same transaction that gave up ownership, so a fold over
+            // the events shows no pending generations.
+            let marks = lance_context_core::rollout_append::merged_watermarks(&uri)
+                .await
+                .unwrap();
+            assert_eq!(marks.len(), 2, "{target}: {marks:?}");
+            let encoded: String = target.bytes().map(|b| format!("{b:02x}")).collect();
+            let events_prefix = format!(
+                "{}/demand-events/{encoded}/",
+                first.config.etcd.etcd_prefix.trim_end_matches('/')
+            );
+            // The merged-watermark publish is detached from release; wait for
+            // both shards' records to carry a merged mark, with a bound.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let events = loop {
+                let events = first
+                    .task_store
+                    .etcd_client()
+                    .clone()
+                    .get(
+                        events_prefix.as_str(),
+                        Some(etcd_client::GetOptions::new().with_prefix()),
+                    )
+                    .await
+                    .unwrap();
+                let merged_count = events
+                    .kvs()
+                    .iter()
+                    .filter(|kv| {
+                        serde_json::from_slice::<lance_context_merge::demand::DemandEvent>(
+                            kv.value(),
+                        )
+                        .is_ok_and(|e| e.merged_through.is_some())
+                    })
+                    .count();
+                if merged_count == 2 {
+                    break events;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{target}: merged watermarks never published ({merged_count}/2)"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            };
+            assert_eq!(events.kvs().len(), 2, "{target}");
+            let mut table = lance_context_merge::demand::TableDemand::default();
+            for kv in events.kvs() {
+                let event: lance_context_merge::demand::DemandEvent =
+                    serde_json::from_slice(kv.value()).unwrap();
+                assert_eq!(
+                    event.source,
+                    lance_context_merge::demand::EventSource::Executor
+                );
+                let expected = marks
+                    .iter()
+                    .find(|(shard, _)| shard.to_string() == event.shard)
+                    .map(|(_, generation)| *generation);
+                assert_eq!(event.merged_through, expected);
+                table.fold(&event, kv.mod_revision(), 0).unwrap();
+            }
+            assert_eq!(table.pending_generations(), 0, "{target}");
         }
     }
 

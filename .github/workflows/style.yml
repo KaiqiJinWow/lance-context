@@ -6,6 +6,8 @@ on:
   pull_request:
     paths:
       - crates/**
+      - vendor/raft-engine/**
+      - .typos.toml
       - Cargo.toml
       - Cargo.lock
       - .github/workflows/style.yml
@@ -55,6 +57,8 @@ jobs:
       # cfg-gated breakage is caught here instead of at release time.
       - name: Clippy (lance-context, default features)
         run: cargo clippy --manifest-path crates/lance-context/Cargo.toml --all-targets -- -D warnings
+      - name: Clippy (WAL experiments)
+        run: cargo clippy -p lance-context-wal --features lab,placement,admission,ipc,record,arrow-contract,runner --all-targets -- -D warnings
 
   typos:
     name: Spell Check

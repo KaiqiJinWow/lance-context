@@ -23,11 +23,101 @@ use tokio::task::JoinHandle;
 use crate::scheduler::generic_target;
 use crate::state::MasterState;
 use crate::stats_store::StatRow;
-use lance_context_api::ExperimentSummary;
+use lance_context_api::{ExperimentSummary, TaskKind};
 
 /// Per-experiment open+observe timeout so one wedged dataset cannot stall a
 /// scan round.
 const OBSERVE_TIMEOUT: Duration = Duration::from_secs(30);
+
+type ScanObservation = (String, Option<(StatRow, bool)>);
+
+/// Early admission uses the ordinary durable queue, never a separate executor.
+/// Bound both new tasks and total control-plane time per scan. A degraded queue
+/// must not turn table observation into thousands of serial request timeouts.
+struct ScanMergeAdmission {
+    remaining: usize,
+    time_left: Duration,
+}
+
+impl ScanMergeAdmission {
+    fn new(state: &MasterState) -> Self {
+        Self {
+            remaining: if state.config.merge_wal_interval_secs == 0 {
+                0
+            } else {
+                crate::scheduler::MAX_SWEEP_ENQUEUE
+            },
+            time_left: Duration::from_secs(10),
+        }
+    }
+
+    async fn observe(&mut self, state: &Arc<MasterState>, row: &StatRow) {
+        if self.remaining == 0
+            || self.time_left.is_zero()
+            || row.pending_wal_generations <= 0
+            || row.pending_wal_generations < state.config.merge_wal_min_generations
+        {
+            return;
+        }
+        let start = std::time::Instant::now();
+        let admit = async {
+            if state
+                .task_store
+                .is_cooling_down(TaskKind::MergeWal, &row.name)
+                .await?
+            {
+                return Ok(false);
+            }
+            let before = state
+                .task_store
+                .get_active_id(TaskKind::MergeWal, &row.name)
+                .await?;
+            // Use the ordinary enqueue even when an active pointer exists:
+            // it validates the record and repairs a stale terminal pointer.
+            let task = crate::scheduler::enqueue(state, TaskKind::MergeWal, &row.name).await?;
+            // Another producer may have won the race. Count conservatively:
+            // admission must never exceed its bound because of concurrency.
+            Ok::<_, lance::Error>(before.as_deref() != Some(task.id.as_str()))
+        };
+        let result = tokio::time::timeout(self.time_left.min(Duration::from_secs(2)), admit).await;
+        self.time_left = self.time_left.saturating_sub(start.elapsed());
+        let outcome = match result {
+            Ok(Ok(true)) => {
+                self.remaining -= 1;
+                "enqueued"
+            }
+            Ok(Ok(false)) => "already_active_or_cooling_down",
+            result => {
+                // A timeout/error can follow a committed enqueue. Do not
+                // replay it or modify ownership; leave reconciliation to the
+                // durable queue and stop early admission for this round.
+                self.remaining = 0;
+                tracing::warn!(target = %row.name, ?result, "scan early merge admission stopped; observation continues");
+                "unavailable"
+            }
+        };
+        metrics::counter!("master_scan_merge_admission_total", "outcome" => outcome).increment(1);
+    }
+}
+
+/// Consume each completed observation before waiting for the rest of the scan.
+/// Incremental (base-version-unchanged) observations also recount pending WAL,
+/// so their counts are fresh and eligible. Failed observations are not.
+async fn collect_observations(
+    state: &Arc<MasterState>,
+    observations: impl futures::Stream<Item = ScanObservation>,
+) -> Vec<ScanObservation> {
+    futures::pin_mut!(observations);
+    let mut admission = ScanMergeAdmission::new(state);
+    let mut observed = Vec::new();
+    while let Some(result) = observations.next().await {
+        if let (_, Some((row, _))) = &result {
+            admission.observe(state, row).await;
+        }
+        observed.push(result);
+    }
+    observed
+}
 
 /// Bound on the compaction half of one `_stats` maintenance pass, which runs
 /// under the store lock, so a slow object store cannot wedge the scanner loop.
@@ -208,12 +298,14 @@ async fn maintain_registry(
 /// for experiments no longer in the registry. Returns the number of
 /// experiments successfully observed.
 pub async fn scan_once(state: &Arc<MasterState>) -> lance::Result<usize> {
-    let _operation = state
+    let operation = state
         .admission
-        .try_admit()
+        .try_admit_named("stats_scan")
         .ok_or_else(|| lance::Error::io("master executor is draining; stats scan not admitted"))?;
+    operation.phase("coordination_lock");
     let guard = state.task_store.coordination_lock("stats-writer").await?;
-    let result = scan_once_inner(state).await;
+    let result = scan_once_inner(state, &operation).await;
+    operation.phase("release_coordination_lock");
     let release = state.task_store.release_coordination_lock(guard).await;
     match (result, release) {
         (Ok(count), Ok(())) => Ok(count),
@@ -223,9 +315,10 @@ pub async fn scan_once(state: &Arc<MasterState>) -> lance::Result<usize> {
 }
 
 async fn try_scan_once(state: &Arc<MasterState>, maintain: bool) -> lance::Result<Option<usize>> {
-    let Some(_operation) = state.admission.try_admit() else {
+    let Some(operation) = state.admission.try_admit_named("stats_scan") else {
         return Ok(None);
     };
+    operation.phase("coordination_lock");
     let Some(guard) = state
         .task_store
         .try_coordination_lock("stats-writer")
@@ -233,10 +326,11 @@ async fn try_scan_once(state: &Arc<MasterState>, maintain: bool) -> lance::Resul
     else {
         return Ok(None);
     };
-    let result = scan_once_inner(state).await;
+    let result = scan_once_inner(state, &operation).await;
     // Maintenance runs under the same writer lock as the scan that just
     // created the versions, and its failure never fails the scan round.
     if maintain {
+        operation.phase("stats_maintenance");
         if let Err(e) = maintain_stats(state).await {
             tracing::warn!(error = %e, "stats maintenance failed");
         }
@@ -264,6 +358,7 @@ async fn try_scan_once(state: &Arc<MasterState>, maintain: bool) -> lance::Resul
             }
         }
     }
+    operation.phase("release_coordination_lock");
     let release = state.task_store.release_coordination_lock(guard).await;
     match (result, release) {
         (Ok(count), Ok(())) => Ok(Some(count)),
@@ -272,7 +367,11 @@ async fn try_scan_once(state: &Arc<MasterState>, maintain: bool) -> lance::Resul
     }
 }
 
-async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
+async fn scan_once_inner(
+    state: &Arc<MasterState>,
+    operation: &crate::admission::Operation,
+) -> lance::Result<usize> {
+    operation.phase("registry_read");
     let scan_start = std::time::Instant::now();
     // Rollout experiments under their bare name; generic stores under the
     // `generic:` task-target prefix, so they occupy distinct rows and the
@@ -309,6 +408,7 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
     // needed) and its compaction counters (which are carried forward). This
     // used to be a `stats.get()` per experiment, taking the stats lock once per
     // experiment per round.
+    operation.phase("previous_snapshot");
     let previous: HashMap<String, StatRow> = {
         let mut stats = state.stats.lock().await;
         stats
@@ -325,23 +425,43 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
     // Observe experiments concurrently (bounded). `None` means this round could
     // not observe that experiment; its previous row is carried over below
     // rather than dropped.
-    let observed: Vec<(String, Option<(StatRow, bool)>)> = stream::iter(entries)
+    operation.phase("observe_tables");
+    let observations = stream::iter(entries)
         .map(|entry| {
             let previous = previous.clone();
             let rollout_options = rollout_options.clone();
             let generic_options = generic_options.clone();
+            let state = state.clone();
             async move {
                 let prev = previous.get(&entry.name);
                 let observed = match entry.kind {
                     ScanKind::Rollout => {
-                        observe_one(&entry.name, &entry.uri, prev, rollout_options).await
+                        observe_one(&entry.name, &entry.uri, prev, rollout_options.clone()).await
                     }
                     ScanKind::Generic => {
-                        observe_generic(&entry.name, &entry.uri, prev, generic_options).await
+                        observe_generic(&entry.name, &entry.uri, prev, generic_options.clone())
+                            .await
                     }
                 };
                 match observed {
-                    Ok(result) => (entry.name, Some(result)),
+                    Ok(result) => {
+                        operation.observed_table();
+                        // Demand reconciliation rides the scan: publish every
+                        // shard's watermark as a scan-sourced event. Detached
+                        // and bounded; the scan never waits on it.
+                        // `entry.name` is already the task target: bare for
+                        // rollout, `generic:<name>` for generic stores.
+                        let target = entry.name.clone();
+                        crate::demand_publish::spawn_scan_demand(
+                            state.clone(),
+                            target,
+                            entry.uri.clone(),
+                            entry.kind,
+                            rollout_options,
+                            generic_options,
+                        );
+                        (entry.name, Some(result))
+                    }
                     Err(e) => {
                         tracing::warn!(store = %entry.name, error = %e, "scan: observe failed");
                         (entry.name, None)
@@ -349,9 +469,8 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
                 }
             }
         })
-        .buffer_unordered(concurrency)
-        .collect()
-        .await;
+        .buffer_unordered(concurrency);
+    let observed = collect_observations(state, observations).await;
 
     let count = observed.iter().filter(|(_, row)| row.is_some()).count();
     let failed = observed.len() - count;
@@ -413,6 +532,7 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
         .filter(|row| !row.name.starts_with("generic:"))
         .cloned()
         .collect();
+    operation.phase("retire_cold_tables");
     let retired = retire_cold_experiments(
         &rollout_rows,
         retire_after,
@@ -429,6 +549,7 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
         .record(retire_start.elapsed().as_secs_f64());
     metrics::gauge!("master_stats_hot_experiments").set(snapshot.len() as f64);
 
+    operation.phase("commit_snapshot");
     let mut stats = state.stats.lock().await;
 
     let mut total_rows: i64 = 0;
@@ -517,7 +638,7 @@ async fn scan_once_inner(state: &Arc<MasterState>) -> lance::Result<usize> {
 /// that finishes inside its interval and one that never does.
 /// Which registry a scan entry came from, which decides how it is opened.
 #[derive(Debug, Clone, Copy)]
-enum ScanKind {
+pub(crate) enum ScanKind {
     Rollout,
     Generic,
 }
@@ -944,6 +1065,200 @@ pub fn spawn_scanner(state: &Arc<MasterState>) -> Option<JoinHandle<()>> {
             }
         }
     }))
+}
+
+#[cfg(test)]
+mod early_merge_tests {
+    use super::*;
+    use clap::Parser;
+
+    async fn fixture(enabled: bool) -> (tempfile::TempDir, Arc<MasterState>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::config::MasterConfig::parse_from(["test"]);
+        config.data_dir = dir.path().to_string_lossy().into_owned();
+        config.etcd.etcd_endpoints = std::env::var("ETCD_TEST_ENDPOINTS")
+            .expect("test requires isolated etcd")
+            .split(',')
+            .map(str::to_owned)
+            .collect();
+        config.etcd.etcd_prefix = format!("/early-scan-test/{}", lance_context_core::generate_id());
+        config.merge_wal_interval_secs = if enabled { 600 } else { 0 };
+        config.merge_wal_min_generations = 8;
+        config.stats_scan_interval_secs = 0;
+        config.worker_endpoints.clear();
+        (dir, MasterState::new(config).await.unwrap())
+    }
+
+    fn row(name: &str, pending: i64) -> StatRow {
+        StatRow {
+            name: name.into(),
+            uri: format!("/unused/{name}"),
+            row_count: 0,
+            fragment_count: 0,
+            last_updated: 0,
+            pending_wal_generations: pending,
+            last_compaction: StatRow::NO_COMPACTION,
+            total_compactions: 0,
+            scanned_at: Utc::now().timestamp_millis(),
+            version: 1,
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn hot_observation_enqueues_before_slow_scan_finishes() {
+        let (_dir, state) = fixture(true).await;
+        let (release, blocked) = tokio::sync::oneshot::channel();
+        // `true` is the unchanged-base fast path: its WAL recount is fresh.
+        let ready = stream::iter(vec![(
+            "generic:hot".into(),
+            Some((row("generic:hot", 80), true)),
+        )]);
+        let slow = stream::once(async move {
+            blocked.await.unwrap();
+            ("slow".into(), None)
+        });
+        let scan_state = state.clone();
+        let scan =
+            tokio::spawn(async move { collect_observations(&scan_state, ready.chain(slow)).await });
+        let id = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(id) = state
+                    .task_store
+                    .get_active_id(TaskKind::MergeWal, "generic:hot")
+                    .await
+                    .unwrap()
+                {
+                    break id;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("hot target waited for the rest of the scan");
+        assert!(!scan.is_finished());
+        // The ordinary queue sees exactly the same durable task.
+        assert_eq!(
+            crate::scheduler::enqueue(&state, TaskKind::MergeWal, "generic:hot")
+                .await
+                .unwrap()
+                .id,
+            id
+        );
+        release.send(()).unwrap();
+        assert_eq!(scan.await.unwrap().len(), 2);
+        assert!(state
+            .task_store
+            .get_active_id(TaskKind::MergeWal, "slow")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn early_admission_respects_disable_threshold_and_new_task_budget() {
+        let (_disabled_dir, disabled) = fixture(false).await;
+        collect_observations(
+            &disabled,
+            stream::iter(vec![("hot".into(), Some((row("hot", 80), false)))]),
+        )
+        .await;
+        assert!(disabled
+            .task_store
+            .get_active_id(TaskKind::MergeWal, "hot")
+            .await
+            .unwrap()
+            .is_none());
+
+        let (_dir, state) = fixture(true).await;
+        let existing = crate::scheduler::enqueue(&state, TaskKind::MergeWal, "active")
+            .await
+            .unwrap();
+        let mut admission = ScanMergeAdmission::new(&state);
+        admission.remaining = 2;
+        for target in [
+            "active",
+            "active",
+            "small",
+            "new-a",
+            "active",
+            "generic:new-b",
+            "over-budget",
+        ] {
+            admission
+                .observe(&state, &row(target, if target == "small" { 7 } else { 80 }))
+                .await;
+        }
+        assert_eq!(
+            state
+                .task_store
+                .get_active_id(TaskKind::MergeWal, "active")
+                .await
+                .unwrap(),
+            Some(existing.id)
+        );
+        for target in ["new-a", "generic:new-b"] {
+            assert!(state
+                .task_store
+                .get_active_id(TaskKind::MergeWal, target)
+                .await
+                .unwrap()
+                .is_some());
+        }
+        for target in ["small", "over-budget"] {
+            assert!(state
+                .task_store
+                .get_active_id(TaskKind::MergeWal, target)
+                .await
+                .unwrap()
+                .is_none());
+        }
+        // An exhausted time budget also leaves scanning intact without writes.
+        let mut admission = ScanMergeAdmission::new(&state);
+        admission.time_left = Duration::ZERO;
+        admission.observe(&state, &row("time-budget", 80)).await;
+        assert!(state
+            .task_store
+            .get_active_id(TaskKind::MergeWal, "time-budget")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn queue_error_preserves_scan_results_and_stops_early_admission() {
+        let (_dir, state) = fixture(true).await;
+        let task = crate::scheduler::enqueue(&state, TaskKind::MergeWal, "broken")
+            .await
+            .unwrap();
+        // Fault injection is confined to this test's unique local-etcd prefix.
+        // The active pointer now references a malformed queue record.
+        state
+            .task_store
+            .etcd_client()
+            .clone()
+            .put(
+                format!("{}/tasks/{}", state.config.etcd.etcd_prefix, task.id),
+                "malformed",
+                None,
+            )
+            .await
+            .unwrap();
+        let input = vec![
+            ("broken".into(), Some((row("broken", 80), false))),
+            ("later".into(), Some((row("later", 90), false))),
+        ];
+        let observed = collect_observations(&state, stream::iter(input.clone())).await;
+        assert_eq!(observed, input, "admission failure must not lose stats");
+        assert!(state
+            .task_store
+            .get_active_id(TaskKind::MergeWal, "later")
+            .await
+            .unwrap()
+            .is_none());
+    }
 }
 
 #[cfg(test)]

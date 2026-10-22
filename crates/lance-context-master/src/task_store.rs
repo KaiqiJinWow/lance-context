@@ -122,7 +122,9 @@ struct EtcdTaskStore {
     prepare_targets: Vec<String>,
     index_prepare_targets: Vec<String>,
     maintenance_catchup_targets: Vec<String>,
+    wal_claim_targets: Vec<String>,
     rollout: lance_context_merge::rollout::MergeRollout,
+    auto_local_merge: bool,
 }
 
 /// Ownership of one running task. Dropping the claim stops lease renewal; etcd
@@ -545,6 +547,36 @@ impl TaskStore {
 
     /// Whether the sweeps should skip this target for now because it has
     /// failed repeatedly. Manual enqueues are not gated by this.
+    /// Targets with a `kind` task queued and targets with one running,
+    /// separately, read in pages. For the shadow planner's comparison
+    /// against reality: "queued" is discovery, "running" is execution, and
+    /// the two must not be conflated.
+    pub async fn list_queued_and_running_targets(
+        &self,
+        kind: TaskKind,
+    ) -> lance::Result<(Vec<String>, Vec<String>)> {
+        let mut queued = Vec::new();
+        let mut running = Vec::new();
+        for (prefix, out) in [
+            (self.inner.queue_prefix(), &mut queued),
+            (self.inner.running_prefix(), &mut running),
+        ] {
+            let (kvs, _) = crate::planner::read_prefix_paged(&self.inner.client, &prefix)
+                .await
+                .map_err(lance::Error::io)?;
+            for kv in kvs {
+                if let Ok(task) = decode_task(&kv.value, &String::from_utf8_lossy(&kv.key)) {
+                    if task.kind == kind {
+                        out.push(task.target);
+                    }
+                }
+            }
+            out.sort();
+            out.dedup();
+        }
+        Ok((queued, running))
+    }
+
     /// Id of the queued or running task that `enqueue(kind, target)` would
     /// dedupe into, if any. Lets a sweep tell a new task from a no-op.
     pub async fn get_active_id(
@@ -712,7 +744,9 @@ impl EtcdTaskStore {
             prepare_targets: config.maintenance.compaction_prepare_targets.clone(),
             index_prepare_targets: config.maintenance.index_prepare_targets.clone(),
             maintenance_catchup_targets: config.maintenance.maintenance_catchup_targets.clone(),
+            wal_claim_targets: config.maintenance.wal_claim_targets.clone(),
             rollout: config.merge_rollout.clone(),
+            auto_local_merge: config.local_merge.master_local_merge_auto,
         })
     }
 
@@ -808,6 +842,7 @@ impl EtcdTaskStore {
 
     fn eligibility_policy(&self) -> eligibility::Policy<'_> {
         eligibility::Policy {
+            auto_local_merge: self.auto_local_merge,
             rollout: &self.rollout,
             compaction_prepare_targets: &self.prepare_targets,
             index_prepare_targets: &self.index_prepare_targets,
@@ -858,6 +893,16 @@ impl EtcdTaskStore {
                 .collect::<lance::Result<Vec<_>>>()?;
 
             for mut task in queued {
+                // Local routing policy only. Apply before dependency probes or
+                // ownership RPCs, including shared and reserved resident pools.
+                // Unselected tasks stay available to other masters. The normal
+                // claim transaction and execution protocol remain unchanged.
+                if task.kind == TaskKind::MergeWal
+                    && !self.wal_claim_targets.is_empty()
+                    && !self.wal_claim_targets.contains(&task.target)
+                {
+                    continue;
+                }
                 // Cheap kind/resident filtering happens before the dependency
                 // probe: an unrunnable kind should cost nothing, and this is
                 // what lets a scarce kind be found behind a dominant one.
@@ -1378,24 +1423,83 @@ impl EtcdTaskStore {
 
     async fn start_keepalive(&self, lease_id: i64) -> lance::Result<LeaseKeepalive> {
         let mut client = self.client.clone();
-        let (mut keeper, mut stream) = client
-            .lease_keep_alive(lease_id)
-            .await
-            .map_err(etcd_error("start lease keepalive"))?;
         let interval = Duration::from_secs((self.lease_ttl / 3).max(1) as u64);
+        let ttl = Duration::from_secs(self.lease_ttl as u64);
+        let (mut keeper, mut stream) =
+            tokio::time::timeout(interval, client.lease_keep_alive(lease_id))
+                .await
+                .map_err(|_| lance::Error::io("start lease keepalive timed out"))?
+                .map_err(etcd_error("start lease keepalive"))?;
+        // etcd-client consumes a positive-TTL response during the handshake.
         let (stop_tx, mut stop_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    _ = &mut stop_rx => break,
-                    _ = tokio::time::sleep(interval) => {
-                        if keeper.keep_alive().await.is_err() {
-                            break;
+                    _ = &mut stop_rx => return,
+                    _ = tokio::time::sleep(interval) => {}
+                }
+                let response = tokio::time::timeout(interval, async {
+                    keeper.keep_alive().await?;
+                    stream.message().await
+                })
+                .await;
+                match response {
+                    Ok(Ok(Some(response))) => {
+                        if response.id() != lease_id || response.ttl() <= 0 {
+                            tracing::warn!(lease_id, "task lease is no longer renewable");
+                            return;
                         }
-                        match tokio::time::timeout(interval, stream.message()).await {
-                            Ok(Ok(Some(response))) if response.ttl() > 0 => {}
-                            _ => break,
+                        continue;
+                    }
+                    failure => tracing::warn!(
+                        lease_id,
+                        ?failure,
+                        "task lease stream interrupted; reconnecting the same lease"
+                    ),
+                }
+
+                // A missing response is not proof that the server failed to
+                // renew. Even beyond our last confirmation, etcd may still
+                // hold this lease. Bound recovery from the stream failure,
+                // letting etcd decide whether this same lease is renewable.
+                // This never grants a lease or recreates ownership keys, and
+                // renewal does not replace a task's publication ownership checks.
+                let recovery_until = tokio::time::Instant::now() + ttl;
+                loop {
+                    let reconnect_started = tokio::time::Instant::now();
+                    if reconnect_started >= recovery_until {
+                        tracing::warn!(
+                            lease_id,
+                            "task lease stream recovery exhausted its retry window"
+                        );
+                        return;
+                    }
+                    let result = tokio::time::timeout_at(
+                        recovery_until.min(reconnect_started + interval),
+                        client.lease_keep_alive(lease_id),
+                    )
+                    .await;
+                    if let Ok(Ok((replacement, replacement_stream))) = result {
+                        if replacement.id() != lease_id {
+                            tracing::warn!(lease_id, "task lease reconnect returned another lease");
+                            return;
                         }
+                        keeper = replacement;
+                        stream = replacement_stream;
+                        metrics::counter!("master_task_lease_stream_recoveries_total").increment(1);
+                        tracing::info!(
+                            lease_id,
+                            "task lease stream recovered without changing ownership"
+                        );
+                        break;
+                    }
+                    // Bound reconnect traffic during an etcd outage. The lease
+                    // identity staggers retries without changing their deadline.
+                    let retry_delay =
+                        interval / 2 + Duration::from_millis(lease_id.unsigned_abs() % 500);
+                    tokio::select! {
+                        _ = &mut stop_rx => return,
+                        _ = tokio::time::sleep_until(recovery_until.min(tokio::time::Instant::now() + retry_delay)) => {}
                     }
                 }
             }
@@ -1937,6 +2041,336 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    struct LeaseTestProxy {
+        endpoint: String,
+        online: tokio::sync::watch::Sender<bool>,
+        responses: tokio::sync::watch::Sender<bool>,
+        task: JoinHandle<()>,
+    }
+
+    impl LeaseTestProxy {
+        async fn start(upstream: &str) -> Self {
+            let upstream = upstream.strip_prefix("http://").unwrap().to_owned();
+            assert!(upstream.starts_with("127.0.0.1:") || upstream.starts_with("localhost:"));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let (online, mut status) = tokio::sync::watch::channel(true);
+            let (responses, response_status) = tokio::sync::watch::channel(true);
+            let task = tokio::spawn(async move {
+                let mut connections = tokio::task::JoinSet::new();
+                loop {
+                    tokio::select! {
+                        accepted = listener.accept() => {
+                            let (mut downstream, _) = accepted.unwrap();
+                            if !*status.borrow_and_update() {
+                                continue;
+                            }
+                            let mut status = status.clone();
+                            let mut response_status = response_status.clone();
+                            let upstream = upstream.clone();
+                            connections.spawn(async move {
+                                tokio::select! {
+                                    _ = status.changed() => {},
+                                    _ = async {
+                                        if let Ok(mut upstream) = tokio::net::TcpStream::connect(upstream).await {
+                                            let (mut client_read, mut client_write) = downstream.split();
+                                            let (mut server_read, mut server_write) = upstream.split();
+                                            let replies = async {
+                                                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                                                let mut buffer = [0; 16 * 1024];
+                                                loop {
+                                                    let count = server_read.read(&mut buffer).await?;
+                                                    if count == 0 {
+                                                        return Ok::<(), std::io::Error>(());
+                                                    }
+                                                    if response_status.wait_for(|enabled| *enabled).await.is_err() {
+                                                        return Ok(());
+                                                    }
+                                                    client_write.write_all(&buffer[..count]).await?;
+                                                }
+                                            };
+                                            tokio::select! {
+                                                _ = tokio::io::copy(&mut client_read, &mut server_write) => {},
+                                                _ = replies => {},
+                                            }
+                                        }
+                                    } => {},
+                                }
+                            });
+                        }
+                        _ = connections.join_next(), if !connections.is_empty() => {}
+                    }
+                }
+            });
+            Self {
+                endpoint,
+                online,
+                responses,
+                task,
+            }
+        }
+    }
+
+    impl Drop for LeaseTestProxy {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn lease_proxy_store() -> (TempDir, LeaseTestProxy, TaskStore, Client) {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_test_writer()
+            .try_init();
+        let upstream = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        let upstream = upstream.split(',').next().unwrap();
+        let proxy = LeaseTestProxy::start(upstream).await;
+        let observer = Client::connect([upstream], None).await.unwrap();
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.etcd.etcd_endpoints = vec![proxy.endpoint.clone()];
+        cfg.etcd.etcd_prefix = format!("/lease-stream-test/{}", generate_id());
+        cfg.etcd_lease_ttl_secs = 6;
+        let store = TaskStore::open(&cfg).await.unwrap();
+        (dir, proxy, store, observer)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback ETCD_TEST_ENDPOINTS"]
+    async fn task_lease_stream_reconnect_preserves_the_same_claim() {
+        let (_dir, proxy, store, mut observer) = lease_proxy_store().await;
+        store
+            .enqueue(TaskKind::MergeWal, "hot", vec![])
+            .await
+            .unwrap();
+        let claim = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let lease = claim.backend.lease_id;
+        let key = claim.backend.claim_key.clone();
+        let token = claim.backend.token.clone();
+        proxy.online.send(false).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        proxy.online.send(true).unwrap();
+        // Prove that the proxy really restored transport before checking lease
+        // recovery. New connections must not inherit an unseen old cut event.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut probe = Client::connect([proxy.endpoint.as_str()], None)
+                .await
+                .unwrap();
+            let values = probe.get(key.clone(), None).await.unwrap();
+            assert_eq!(values.kvs()[0].value(), token.as_bytes());
+        })
+        .await
+        .expect("proxy did not restore etcd connectivity");
+        // Survive more than the original lease lifetime after a real TCP cut.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let values = observer.get(key.clone(), None).await.unwrap();
+        assert_eq!(
+            values.kvs().len(),
+            1,
+            "a transient stream failure expired the claim"
+        );
+        assert_eq!(values.kvs()[0].value(), token.as_bytes());
+        assert_eq!(
+            values.kvs()[0].lease(),
+            lease,
+            "recovery must not replace the lease"
+        );
+        assert!(!claim.backend.keepalive.task.is_finished());
+        // Dropping a claim must still stop renewal, including after reconnect.
+        drop(claim);
+        tokio::time::timeout(Duration::from_secs(9), async {
+            while !observer
+                .get(key.clone(), None)
+                .await
+                .unwrap()
+                .kvs()
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .unwrap();
+        observer
+            .delete(
+                store.inner.prefix.clone(),
+                Some(etcd_client::DeleteOptions::new().with_prefix()),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback ETCD_TEST_ENDPOINTS"]
+    async fn task_lease_stream_recovers_when_renewal_replies_are_delayed() {
+        let (_dir, proxy, store, mut observer) = lease_proxy_store().await;
+        store
+            .enqueue(TaskKind::MergeWal, "hot", vec![])
+            .await
+            .unwrap();
+        let claim = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let key = claim.backend.claim_key.clone();
+        let token = claim.backend.token.clone();
+        let lease = claim.backend.lease_id;
+        // Let the first ordinary renewal complete. Then forward requests to
+        // etcd while withholding responses: an unacknowledged renewal can
+        // extend the real lease beyond the client's last confirmation.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        proxy.responses.send(false).unwrap();
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        // Restore responses before any observer RPC: a slow linearizable
+        // read must not silently extend the injected six-second outage.
+        let renewal_still_running = !claim.backend.keepalive.task.is_finished();
+        proxy.responses.send(true).unwrap();
+        let values = observer.get(key.clone(), None).await.unwrap();
+        assert_eq!(
+            values.kvs().len(),
+            1,
+            "fixture must retain a live server lease"
+        );
+        assert_eq!(values.kvs()[0].value(), token.as_bytes());
+        assert_eq!(values.kvs()[0].lease(), lease);
+        assert!(
+            observer
+                .lease_time_to_live(lease, None)
+                .await
+                .unwrap()
+                .ttl()
+                > 0
+        );
+        assert!(renewal_still_running,
+            "unacknowledged renewals must be retried on the same lease within a bounded recovery window");
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        let values = observer.get(key, None).await.unwrap();
+        assert_eq!(
+            values.kvs().len(),
+            1,
+            "restored responses did not resume renewal"
+        );
+        assert_eq!(values.kvs()[0].value(), token.as_bytes());
+        assert_eq!(values.kvs()[0].lease(), lease);
+        assert!(!claim.backend.keepalive.task.is_finished());
+        drop(claim);
+        observer.lease_revoke(lease).await.unwrap();
+        observer
+            .delete(
+                store.inner.prefix.clone(),
+                Some(etcd_client::DeleteOptions::new().with_prefix()),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback ETCD_TEST_ENDPOINTS"]
+    async fn task_lease_stream_recovery_stops_after_a_persistent_outage() {
+        let (_dir, proxy, store, mut observer) = lease_proxy_store().await;
+        store
+            .enqueue(TaskKind::MergeWal, "hot", vec![])
+            .await
+            .unwrap();
+        let claim = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let key = claim.backend.claim_key.clone();
+        proxy.online.send(false).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !claim.backend.keepalive.task.is_finished() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("renewal task exceeded its bounded recovery window");
+        // Client termination and server-side lease deletion are separate:
+        // etcd may delay its expiry transaction or this linearizable read.
+        // A slow observer must not mask whether the client stopped in time.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !observer
+                .get(key.clone(), None)
+                .await
+                .unwrap()
+                .kvs()
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .unwrap();
+        proxy.online.send(true).unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(observer.get(key, None).await.unwrap().kvs().is_empty());
+        drop(claim);
+        observer
+            .delete(
+                store.inner.prefix.clone(),
+                Some(etcd_client::DeleteOptions::new().with_prefix()),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires loopback ETCD_TEST_ENDPOINTS"]
+    async fn task_lease_stream_recovery_never_resurrects_revoked_ownership() {
+        let (_dir, proxy, store, mut observer) = lease_proxy_store().await;
+        store
+            .enqueue(TaskKind::MergeWal, "hot", vec![])
+            .await
+            .unwrap();
+        let claim = store
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        let lease = claim.backend.lease_id;
+        let key = claim.backend.claim_key.clone();
+        proxy.online.send(false).unwrap();
+        observer.lease_revoke(lease).await.unwrap();
+        observer
+            .put(key.clone(), "replacement-owner", None)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        proxy.online.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(9), async {
+            while !claim.backend.keepalive.task.is_finished() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let values = observer.get(key, None).await.unwrap();
+        assert_eq!(values.kvs()[0].value(), b"replacement-owner");
+        assert_eq!(values.kvs()[0].lease(), 0);
+        assert!(
+            observer
+                .lease_time_to_live(lease, None)
+                .await
+                .unwrap()
+                .ttl()
+                <= 0
+        );
+        drop(claim);
+        observer
+            .delete(
+                store.inner.prefix.clone(),
+                Some(etcd_client::DeleteOptions::new().with_prefix()),
+            )
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn completion_cleanup_never_changes_the_transaction_outcome() {
         let task = new_task(TaskKind::MergeWal, "hot", Vec::new());
@@ -2306,9 +2740,12 @@ mod tests {
 
     fn config(dir: &TempDir) -> MasterConfig {
         MasterConfig {
+            legacy_retirement_request: None,
+            local_merge: Default::default(),
             append: Default::default(),
             catchup: Default::default(),
             wal_tail: Default::default(),
+            planner: Default::default(),
             maintenance: Default::default(),
             merge_rollout: Default::default(),
             data_dir: dir.path().to_string_lossy().to_string(),
@@ -2336,6 +2773,8 @@ mod tests {
             worker_endpoints: vec![],
             task_concurrency: 4,
             merge_wal_concurrency: 4,
+            legacy_merge_wait_concurrency: 32,
+            legacy_merge_foreground_secs: 30,
             etcd: lance_context_core::etcd::EtcdConfig {
                 etcd_endpoints: vec![],
                 etcd_prefix: "/test".to_string(),
@@ -2350,6 +2789,94 @@ mod tests {
             task_cooldown_max_secs: 21_600,
             ui_dir: None,
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn wal_claim_targets_preserve_queue_peers_and_writer_exclusion() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.etcd.etcd_endpoints = std::env::var("ETCD_TEST_ENDPOINTS")
+            .unwrap()
+            .split(',')
+            .map(str::to_owned)
+            .collect();
+        cfg.etcd.etcd_prefix = format!("/wal-claim-targets/{}", generate_id());
+        let peer = TaskStore::open(&cfg).await.unwrap();
+        cfg.maintenance.wal_claim_targets = vec!["hot".into()];
+        let selected = TaskStore::open(&cfg).await.unwrap();
+        let broken = peer
+            .enqueue(
+                TaskKind::MergeWal,
+                "excluded-dependency",
+                vec!["missing".into()],
+            )
+            .await
+            .unwrap();
+        // Reach the selected target on a later queue page, without consuming
+        // unrelated tasks or evaluating their dependencies.
+        for i in 0..TASK_POLL_BATCH {
+            peer.enqueue(TaskKind::MergeWal, &format!("other-{i}"), vec![])
+                .await
+                .unwrap();
+        }
+        let hot = peer
+            .enqueue(TaskKind::MergeWal, "hot", vec![])
+            .await
+            .unwrap();
+        let claim = selected.claim_next().await.unwrap().unwrap();
+        assert_eq!(claim.task.id, hot.id);
+        assert_eq!(
+            selected.get(&broken.id).await.unwrap().unwrap().state,
+            TaskState::Queued
+        );
+        assert_eq!(peer.queue_depth().await.unwrap(), TASK_POLL_BATCH + 1);
+        // The filter cannot bypass an existing owner, even on the same process.
+        peer.enqueue(TaskKind::Compact, "hot", vec![])
+            .await
+            .unwrap();
+        assert!(selected.claim_next().await.unwrap().is_none());
+        assert!(selected
+            .claim_resident_merge(&["other-0".into()])
+            .await
+            .unwrap()
+            .is_none());
+        // Maintenance on unselected tables and claims by another master remain
+        // independent of this master's local routing restriction.
+        let index = peer
+            .enqueue(TaskKind::IndexId, "outside", vec![])
+            .await
+            .unwrap();
+        let maintenance = selected.claim_next().await.unwrap().unwrap();
+        assert_eq!(maintenance.task.id, index.id);
+        selected
+            .finish(maintenance, Ok("index done".into()))
+            .await
+            .unwrap();
+        let other = peer
+            .claim_next_of_kinds(TaskKinds::MERGE_WAL)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(other.task.target.starts_with("other-"));
+        peer.finish(other, Ok("peer done".into())).await.unwrap();
+        selected.finish(claim, Ok("hot done".into())).await.unwrap();
+        let compact = selected.claim_next().await.unwrap().unwrap();
+        assert_eq!(compact.task.kind, TaskKind::Compact);
+        assert_eq!(compact.task.target, "hot");
+        selected
+            .finish(compact, Ok("compact done".into()))
+            .await
+            .unwrap();
+        peer.inner
+            .client
+            .clone()
+            .delete(
+                cfg.etcd.etcd_prefix,
+                Some(etcd_client::DeleteOptions::new().with_prefix()),
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -2545,7 +3072,7 @@ mod tests {
             .put(key.clone(), "external-owner", None)
             .await
             .unwrap();
-        let targets = ["hot", "draining", "external", "generic:gs"].map(str::to_owned);
+        let targets = ["hot", "draining", "external"].map(str::to_owned);
         let claim = store.claim_resident_merge(&targets).await.unwrap().unwrap();
         assert_eq!(claim.task.target, "hot");
         // A second replica cannot take the running canonical task.
@@ -2578,6 +3105,18 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+        let generic = store
+            .claim_resident_merge(&["generic:gs".into()])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(generic.task.target, "generic:gs");
+        assert!(other
+            .claim_resident_merge(&["generic:gs".into()])
+            .await
+            .unwrap()
+            .is_none());
+        store.finish(generic, Ok("done".into())).await.unwrap();
         store
             .inner
             .client

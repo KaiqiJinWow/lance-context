@@ -11,7 +11,9 @@ use lance_context_api::{
     CompactResponse, CompactStatsResponse, CreateRolloutStoreRequest, GetRolloutResponse,
     ListRolloutStoresResponse, ListRolloutsResponse, RolloutStoreInfo, VersionResponse,
 };
-use lance_context_core::{rollout_record_from_add_request, rollout_record_to_dto};
+#[cfg(test)]
+use lance_context_core::rollout_record_from_add_request;
+use lance_context_core::rollout_record_to_dto;
 use lance_context_core::{
     CompactionConfig, RolloutFilters, RolloutRecord, RolloutStore, RolloutStoreOptions,
 };
@@ -258,8 +260,8 @@ pub async fn get_rollout_store(
     let store = store_lock.read().await;
 
     Ok(Json(RolloutStoreInfo {
-        name: name.clone(),
-        uri: state.rollout_uri(&name),
+        name,
+        uri: store.uri().to_string(),
         version: Some(store.version()),
     }))
 }
@@ -356,10 +358,7 @@ pub async fn add_rollouts(
     let store_lock = state.get_or_open_rollout_store(&name).await?;
 
     let ids: Vec<String> = records.iter().map(|r| r.id.clone()).collect();
-    let core_records: Vec<RolloutRecord> = records
-        .iter()
-        .map(rollout_record_from_add_request)
-        .collect();
+    let core_records: Vec<RolloutRecord> = records.into_iter().map(RolloutRecord::from).collect();
     let count = core_records.len();
 
     // A read lock: `add` is `&self` and MemWAL appends are internally
@@ -536,47 +535,24 @@ pub async fn list_rollouts(
     }))
 }
 
-/// Run the normal shared-lock point lookup first, then refresh and retry under
-/// the exclusive lock only when it would otherwise return a false miss from a
-/// stale cached base dataset.
-async fn get_rollout_refreshing_on_miss(
+/// Core point reads refresh cloned snapshots around WAL fallback. A stale-base
+/// hit or final miss therefore stays under the shared store guard.
+async fn get_rollout_shared(
     store_lock: &RwLock<RolloutStore>,
     id: &str,
 ) -> Result<Option<RolloutRecord>, AppError> {
-    {
-        let store = store_lock.read().await;
-        let record = store.get_by_id(id).await.map_err(AppError::from_lance)?;
-        if record.is_some() || store.is_version_pinned() {
-            return Ok(record);
-        }
-    }
-
-    let mut store = store_lock.write().await;
-    if !store.is_version_pinned() {
-        store.refresh_latest().await.map_err(AppError::from_lance)?;
-    }
+    let store = store_lock.read().await;
     store.get_by_id(id).await.map_err(AppError::from_lance)
 }
 
-/// Blob equivalent of [`get_rollout_refreshing_on_miss`]. A successful payload
-/// hit stays on the shared-lock fast path; only `None` pays the manifest refresh
-/// and retry.
-async fn get_rollout_blob_refreshing_on_miss(
+/// Core blob lookup refreshes cloned base snapshots around WAL fallback and
+/// retries missing-file races. Even a final miss stays under the shared guard,
+/// so it does not queue an exclusive refresh behind concurrent append/flush.
+async fn get_rollout_blob_shared(
     store_lock: &RwLock<RolloutStore>,
     id: &str,
 ) -> Result<Option<Vec<u8>>, AppError> {
-    {
-        let store = store_lock.read().await;
-        let payload = store.get_blob(id).await.map_err(AppError::from_lance)?;
-        if payload.is_some() || store.is_version_pinned() {
-            return Ok(payload);
-        }
-    }
-
-    let mut store = store_lock.write().await;
-    if !store.is_version_pinned() {
-        store.refresh_latest().await.map_err(AppError::from_lance)?;
-    }
+    let store = store_lock.read().await;
     store.get_blob(id).await.map_err(AppError::from_lance)
 }
 
@@ -586,7 +562,7 @@ pub async fn get_rollout(
 ) -> Result<Json<GetRolloutResponse>, AppError> {
     let store_lock = state.get_or_open_rollout_store(&name).await?;
 
-    let record = get_rollout_refreshing_on_miss(&store_lock, &id).await?;
+    let record = get_rollout_shared(&store_lock, &id).await?;
 
     Ok(Json(GetRolloutResponse {
         record: record.map(rollout_record_to_dto),
@@ -607,11 +583,8 @@ pub async fn fetch_rollout_blob(
 ) -> Result<Response, AppError> {
     let store_lock = state.get_or_open_rollout_store(&name).await?;
 
-    let (bytes, reservation) = load_blob_with_budget(
-        &state,
-        get_rollout_blob_refreshing_on_miss(&store_lock, &id),
-    )
-    .await?;
+    let (bytes, reservation) =
+        load_blob_with_budget(&state, get_rollout_blob_shared(&store_lock, &id)).await?;
     let bytes =
         bytes.ok_or_else(|| AppError::NotFound(format!("Rollout '{}' has no payload", id)))?;
 
@@ -652,6 +625,15 @@ pub async fn compact_rollout(
     Path(name): Path<String>,
     Json(req): Json<CompactRequest>,
 ) -> Result<Json<CompactResponse>, AppError> {
+    // This legacy HTTP path has no durable execution or commit authorizer.
+    // Once a table is draining or owned, only the master's fenced maintenance
+    // path may publish a rewrite. Check before opening or locking its handle.
+    state.merge_executions.legacy_allowed(&name)?;
+    if state.merge_executions.fenced_mode().await? {
+        return Err(AppError::Overloaded(
+            "fenced table maintenance must run through the master".into(),
+        ));
+    }
     let store_lock = state.get_or_open_rollout_store(&name).await?;
 
     let config = if req.target_rows_per_fragment.is_some() || req.materialize_deletions.is_some() {
@@ -726,8 +708,26 @@ pub async fn merge_wal(
     Path(name): Path<String>,
 ) -> Result<Json<MergeWalResponse>, AppError> {
     state.merge_executions.legacy_allowed(&name)?;
-    let _slot = state.acquire_merge_slot().await;
-    merge_wal_owned(State(state), Path(name)).await
+    if state.merge_executions.fenced_mode().await? {
+        crate::merge_execution::publish_background_request(state.clone(), name.clone());
+        let result = crate::merge_execution::spawn_background(state, name).await?;
+        let reclaimed = result
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?
+            .map_err(AppError::Internal)?;
+        return Ok(Json(MergeWalResponse { reclaimed }));
+    }
+    let execution_state = state.clone();
+    let execution_name = name.clone();
+    state
+        .merge_executions
+        .legacy
+        .run(&name, "http", true, |started| async move {
+            let _slot = execution_state.acquire_merge_slot().await;
+            started.running();
+            merge_wal_owned(State(execution_state.clone()), Path(execution_name)).await
+        })
+        .await
 }
 
 pub(crate) async fn merge_wal_owned(
@@ -735,6 +735,8 @@ pub(crate) async fn merge_wal_owned(
     Path(name): Path<String>,
 ) -> Result<Json<MergeWalResponse>, AppError> {
     let store_lock = state.get_or_open_rollout_store(&name).await?;
+    let merge_gate = { store_lock.read().await.merge_preparation_gate() };
+    let _merge = merge_gate.lock().await;
     // Split by lock scope: seal + read every flushed generation under the
     // *read* lock so ingest on this store keeps running, then take the write
     // lock only for the short commit. Holding the write lock across the whole
@@ -744,7 +746,7 @@ pub(crate) async fn merge_wal_owned(
         let store = store_lock.read().await;
         ::metrics::histogram!("rollout_wal_merge_lock_wait_seconds")
             .record(lock_start.elapsed().as_secs_f64());
-        match store.prepare_cleanup_merge().await {
+        match store.prepare_recovered_cleanup_merge().await {
             Ok(prepared) => prepared,
             Err(e) => {
                 ::metrics::counter!("rollout_wal_cleanup_total", "result" => "failed").increment(1);
@@ -803,6 +805,80 @@ mod tests {
 
     use super::*;
     use crate::state::AppState;
+
+    #[tokio::test]
+    async fn legacy_compaction_cannot_bypass_owned_or_draining_admission() {
+        let dir = TempDir::new().unwrap();
+        let mut state = AppState::new_for_test(dir.path().to_path_buf()).await;
+        state.merge_executions.rollout.owned_targets = vec!["owned".into()];
+        state.merge_executions.rollout.drain_targets = vec!["draining".into()];
+        let state = Arc::new(state);
+        for name in ["owned", "draining", "legacy"] {
+            let (status, Json(_)) = create_rollout_store(
+                State(state.clone()),
+                Json(CreateRolloutStoreRequest {
+                    name: name.into(),
+                    storage_options: None,
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(status, StatusCode::CREATED);
+            let handle = state.get_or_open_rollout_store(name).await.unwrap();
+            // A live reader must not make rejection wait for the write lock.
+            let reader = handle.read().await;
+            let version = reader.version();
+            if name != "legacy" {
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    compact_rollout(
+                        State(state.clone()),
+                        Path(name.into()),
+                        Json(CompactRequest::default()),
+                    ),
+                )
+                .await
+                .expect("protected maintenance must reject before acquiring a store lock");
+                assert!(matches!(result, Err(AppError::Overloaded(_))));
+                assert_eq!(reader.version(), version);
+            } else {
+                drop(reader);
+                let Json(compacted) = compact_rollout(
+                    State(state.clone()),
+                    Path(name.into()),
+                    Json(CompactRequest::default()),
+                )
+                .await
+                .expect("unowned legacy compaction remains available");
+                assert_eq!(compacted.fragments_removed, 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn blob_miss_does_not_require_exclusive_store_lock() {
+        let dir = TempDir::new().unwrap();
+        let store = RolloutStore::open_with_options(
+            dir.path().to_str().unwrap(),
+            RolloutStoreOptions::default(),
+        )
+        .await
+        .unwrap();
+        let store_lock = RwLock::new(store);
+        // Appends hold a shared guard while adding/flushing. A missing blob
+        // must finish without upgrading to an exclusive guard behind them.
+        let concurrent_request = store_lock.read().await;
+        let version = concurrent_request.version();
+        let payload = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            get_rollout_blob_shared(&store_lock, "absent"),
+        )
+        .await
+        .expect("a missing blob must not wait for another shared store guard")
+        .unwrap();
+        assert!(payload.is_none());
+        assert_eq!(concurrent_request.version(), version);
+    }
 
     #[test]
     fn flush_query_param_is_parsed_conservatively() {
@@ -1140,7 +1216,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn point_lookup_routes_refresh_stale_base_only_after_a_miss() {
+    async fn point_lookup_routes_keep_shared_guard_for_fresh_base_and_miss() {
         let (state, _dir) = rollout_state().await;
         let cached = state.get_or_open_rollout_store("rl").await.unwrap();
         let uri = state.rollout_uri("rl");
@@ -1161,14 +1237,36 @@ mod tests {
         assert_eq!(writer.pending_wal_generations().await.unwrap(), 0);
         assert!(writer.version() > cached.read().await.version());
 
-        let Json(found) = get_rollout(
-            State(state.clone()),
-            Path(("rl".to_string(), first.id.clone())),
+        let resident_read = cached.read().await;
+        let original_version = resident_read.version();
+        let Json(found) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            get_rollout(
+                State(state.clone()),
+                Path(("rl".to_string(), first.id.clone())),
+            ),
         )
         .await
+        .expect("a newly merged row must not wait for an exclusive store lock")
         .unwrap();
         assert_eq!(found.record.unwrap().id, first.id);
-        assert_eq!(cached.read().await.version(), writer.version());
+        let Json(missing) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            get_rollout(
+                State(state.clone()),
+                Path(("rl".to_string(), "absent".to_string())),
+            ),
+        )
+        .await
+        .expect("a missing row must not wait for an exclusive store lock")
+        .unwrap();
+        assert!(missing.record.is_none());
+        assert_eq!(resident_read.version(), original_version);
+        drop(resident_read);
+
+        // Establish a cached base hit for the second half of the test without
+        // making point reads mutate the resident store.
+        cached.write().await.refresh_latest().await.unwrap();
 
         let cached_version = cached.read().await.version();
         let payload = b"externally-merged-blob".to_vec();
@@ -1194,17 +1292,25 @@ mod tests {
         assert_eq!(found.record.unwrap().id, first.id);
         assert_eq!(cached.read().await.version(), cached_version);
 
-        let response = fetch_rollout_blob(
-            State(state.clone()),
-            Path(("rl".to_string(), blob_record.id)),
+        // Another shared reader must not delay a blob found in the new base.
+        // Holding this guard exposes any regression to an exclusive refresh.
+        let resident_read = cached.read().await;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fetch_rollout_blob(
+                State(state.clone()),
+                Path(("rl".to_string(), blob_record.id)),
+            ),
         )
         .await
+        .expect("a newly merged blob must not wait for an exclusive store lock")
         .unwrap();
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
         assert_eq!(bytes.as_ref(), payload.as_slice());
-        assert_eq!(cached.read().await.version(), writer.version());
+        assert_eq!(resident_read.version(), cached_version);
+        drop(resident_read);
     }
 
     #[tokio::test]

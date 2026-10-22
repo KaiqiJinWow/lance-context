@@ -35,7 +35,9 @@ use lance_index::mem_wal::ShardManifest;
 use crate::generic_codec::{batch_to_rows, rows_to_batch, Row};
 use crate::merge_budget::MergeMemoryBudget;
 use crate::store::{CompactionConfig, CompactionStats};
-use crate::store_base::{ListSource, PreparedMerge, StorageBase, StorageBaseOptions};
+use crate::store_base::{
+    is_not_found_error, ListSource, PreparedMerge, StorageBase, StorageBaseOptions,
+};
 use lance_context_api::schema_spec::{SchemaSpec, ID_COLUMN};
 use lance_context_api::MAX_BATCH_GET_IDS;
 
@@ -444,26 +446,38 @@ impl GenericStore {
         if let Some(filter) = filter {
             // Keep point/filtered reads on this handle's view. The server's
             // refresh-on-miss path refreshes the cached handle itself; reading
-            // a newer clone here would bypass that cache update.
-            let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
-            let mut scanner = self
-                .base
-                .lsm_scanner()
-                .await?
-                .project(&refs)?
-                .filter(filter)?;
-            if limit.is_some() || offset.is_some() {
-                scanner = scanner.limit(
-                    map_i64_bound("limit", limit)?,
-                    map_i64_bound("offset", offset)?,
-                )?;
+            // a newer clone on every lookup would bypass that cache update.
+            let result = async {
+                let snapshots = self.base.wal_shard_snapshots().await?;
+                self.scan_filtered_snapshot(
+                    self.base.dataset.clone(),
+                    snapshots,
+                    filter,
+                    limit,
+                    offset,
+                    columns,
+                )
+                .await
             }
-            let mut stream = scanner.try_into_stream().await?;
-            let mut rows = Vec::new();
-            while let Some(batch) = stream.try_next().await? {
-                rows.extend(batch_to_rows(&self.spec, &batch)?);
+            .await;
+            if !self.base.is_version_pinned()
+                && matches!(&result, Err(error) if is_not_found_error(error)
+                    && !matches!(error, LanceError::InvalidInput { .. } | LanceError::SchemaMismatch { .. }))
+            {
+                // GC can remove an opened generation during the scan. An
+                // error is not an absent row: retry a fresh consistent view.
+                // Successful reads and ordinary misses retain cache semantics.
+                return self
+                    .base
+                    .read_consistent(ListSource::All, |dataset, snapshots| {
+                        self.scan_filtered_snapshot(
+                            dataset, snapshots, filter, limit, offset, columns,
+                        )
+                    })
+                    .boxed()
+                    .await;
             }
-            return Ok(rows);
+            return result;
         }
 
         // Only unfiltered lists use this compatibility recovery. Keep retries
@@ -509,6 +523,34 @@ impl GenericStore {
             .await
     }
 
+    async fn scan_filtered_snapshot(
+        &self,
+        dataset: lance::Dataset,
+        snapshots: Vec<ShardSnapshot>,
+        filter: &str,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        columns: &[String],
+    ) -> LanceResult<Vec<Row>> {
+        let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
+        let mut scanner =
+            StorageBase::lsm_scanner_for_dataset(&dataset, ID_COLUMN, ListSource::All, snapshots)
+                .project(&refs)?
+                .filter(filter)?;
+        if limit.is_some() || offset.is_some() {
+            scanner = scanner.limit(
+                map_i64_bound("limit", limit)?,
+                map_i64_bound("offset", offset)?,
+            )?;
+        }
+        let mut stream = scanner.try_into_stream().await?;
+        let mut rows = Vec::new();
+        while let Some(batch) = stream.try_next().await? {
+            rows.extend(batch_to_rows(&self.spec, &batch)?);
+        }
+        Ok(rows)
+    }
+
     /// Narrow compatibility path for Lance 9's broken batched PK sidecars.
     /// Physical scans supply only candidate keys; the native point planner
     /// still decides visibility/newest-wins, including replay and tombstones.
@@ -528,7 +570,7 @@ impl GenericStore {
         // pending WAL generations before the key/work budgets can reject it.
         collect_scan_keys(dataset, &mut ids, &mut id_bytes, &mut scanned).await?;
         for snapshot in snapshots {
-            for generation in &snapshot.flushed_generations {
+            for generation in &snapshot.sstables {
                 let path = self
                     .base
                     .flushed_generation_uri(snapshot.shard_id, &generation.path);
@@ -621,6 +663,14 @@ impl GenericStore {
         self.base.cleanup_own_shard().await
     }
 
+    /// Admission for a split merge on this resident store. Clone under a short
+    /// store read lock, release that lock, then await the gate; retain the guard
+    /// until commit finishes. Reads, ingestion and other tables do not take it.
+    #[must_use]
+    pub fn merge_preparation_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.base.merge_preparation_gate()
+    }
+
     /// The shared-lock half of [`Self::maybe_merge_wal`]: `None` unless the
     /// count trigger is configured and met.
     pub async fn prepare_count_merge(
@@ -641,6 +691,13 @@ impl GenericStore {
         self.base.own_shard_watermark().await
     }
 
+    /// Every shard's watermark from its latest manifest. Metadata only.
+    pub async fn all_shard_watermarks(
+        &self,
+    ) -> LanceResult<Vec<crate::store_base::ShardWatermark>> {
+        self.base.all_shard_watermarks().await
+    }
+
     /// The shared-lock half of [`Self::cleanup_wal`]: seal, then read a
     /// budgeted prefix of flushed generations into memory. Callers holding a
     /// read lock run this while appends continue, then take the write lock
@@ -649,6 +706,15 @@ impl GenericStore {
         &self,
     ) -> LanceResult<Option<(ShardManifestStore, ShardManifest, PreparedMerge)>> {
         self.base.prepare_cleanup_merge().await
+    }
+
+    /// Recover this instance's unsealed WAL, then prepare cleanup. The caller
+    /// must exclusively own the ingestion writer ID, as when appending. Never
+    /// use this to merge a live worker's shard from a maintenance master.
+    pub async fn prepare_recovered_cleanup_merge(
+        &self,
+    ) -> LanceResult<Option<(ShardManifestStore, ShardManifest, PreparedMerge)>> {
+        self.base.prepare_recovered_cleanup_merge().await
     }
 
     /// Commit a merge prepared by [`Self::prepare_cleanup_merge`].
@@ -842,6 +908,68 @@ mod tests {
     use lance_context_api::schema_spec::{ColumnSpec, ColumnType};
     use serde_json::json;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn filtered_point_snapshot_recovers_peer_gc_and_preserves_filter() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let writer = GenericStore::open(uri, spec(), sealing()).await.unwrap();
+        writer
+            .add(&[
+                row(json!({"id":"wanted", "user_id":"value"})),
+                row(json!({"id":"other", "user_id":"hidden"})),
+            ])
+            .await
+            .unwrap();
+        let reader = GenericStore::open_existing(uri, Default::default())
+            .await
+            .unwrap();
+        let writer = tokio::sync::Mutex::new(writer);
+        let attempts = AtomicUsize::new(0);
+        let columns = vec!["id".to_string(), "user_id".to_string()];
+        let rows = reader
+            .base
+            .read_consistent(ListSource::All, |dataset, snapshots| {
+                let reader = &reader;
+                let writer = &writer;
+                let attempts = &attempts;
+                let columns = &columns;
+                async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        writer.lock().await.cleanup_wal().await.unwrap();
+                        for snapshot in &snapshots {
+                            for generation in &snapshot.sstables {
+                                let path = reader
+                                    .base
+                                    .flushed_generation_uri(snapshot.shard_id, &generation.path);
+                                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                                    while std::path::Path::new(&path).exists() {
+                                        tokio::task::yield_now().await;
+                                    }
+                                })
+                                .await
+                                .unwrap();
+                            }
+                        }
+                    }
+                    reader
+                        .scan_filtered_snapshot(
+                            dataset,
+                            snapshots,
+                            "id = 'wanted'",
+                            Some(1),
+                            None,
+                            columns,
+                        )
+                        .await
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(rows, vec![row(json!({"id":"wanted", "user_id":"value"}))]);
+    }
 
     fn spec() -> SchemaSpec {
         SchemaSpec::new(vec![
@@ -1269,6 +1397,110 @@ mod tests {
             let reopened = GenericStore::open_existing(&uri, sealing()).await.unwrap();
             assert_eq!(reopened.spec(), &spec());
             assert_eq!(reopened.list(None, None).await.unwrap().len(), 1);
+        });
+    }
+
+    #[tokio::test]
+    async fn cold_maintenance_cleanup_does_not_claim_a_live_ingestion_epoch() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let options = GenericStoreOptions {
+            shard_id: Some("live-ingestion-writer".into()),
+            ..Default::default()
+        };
+        let writer = GenericStore::open(uri, spec(), options.clone())
+            .await
+            .unwrap();
+        writer
+            .add(&[row(json!({"id":"shared", "score":1.0}))])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        let before = writer
+            .own_shard_watermark()
+            .await
+            .unwrap()
+            .unwrap()
+            .writer_epoch;
+        let mut maintenance = GenericStore::open_existing(uri, options).await.unwrap();
+        let (manifests, manifest, prepared) =
+            maintenance.prepare_cleanup_merge().await.unwrap().unwrap();
+        maintenance
+            .commit_prepared_merge(&manifests, &manifest, prepared)
+            .await
+            .unwrap();
+        writer
+            .add(&[row(json!({"id":"shared", "score":2.0}))])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        assert_eq!(
+            writer
+                .own_shard_watermark()
+                .await
+                .unwrap()
+                .unwrap()
+                .writer_epoch,
+            before
+        );
+        assert_eq!(
+            writer.get("shared", None).await.unwrap().unwrap()["score"],
+            json!(2.0)
+        );
+    }
+
+    #[test]
+    fn cleanup_recovers_own_wal_updates_without_new_ingest_after_runtime_exit() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_string_lossy().to_string();
+        let options = GenericStoreOptions {
+            shard_id: Some("restarted-generic-writer".into()),
+            ..Default::default()
+        };
+        let old_runtime = tokio::runtime::Runtime::new().unwrap();
+        let old = old_runtime.block_on(async {
+            let store = GenericStore::open(&uri, spec(), options.clone())
+                .await
+                .unwrap();
+            store
+                .add(&[row(json!({"id":"shared", "score":1.0}))])
+                .await
+                .unwrap();
+            store.flush().await.unwrap();
+            store
+                .add(&[row(json!({"id":"shared", "score":2.0}))])
+                .await
+                .unwrap();
+            store
+        });
+        drop(old_runtime);
+        drop(old);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut recovered = GenericStore::open_existing(&uri, options).await.unwrap();
+            assert_eq!(
+                recovered.get("shared", None).await.unwrap().unwrap()["score"],
+                json!(1.0)
+            );
+            let (manifests, manifest, prepared) = recovered
+                .prepare_recovered_cleanup_merge()
+                .await
+                .unwrap()
+                .expect("own WAL must recover without a new append");
+            assert!(
+                recovered
+                    .commit_prepared_merge(&manifests, &manifest, prepared)
+                    .await
+                    .unwrap()
+                    > 0
+            );
+            assert_eq!(
+                recovered.get("shared", None).await.unwrap().unwrap()["score"],
+                json!(2.0)
+            );
+            assert_eq!(recovered.list(None, None).await.unwrap().len(), 1);
+            assert_eq!(recovered.cleanup_wal().await.unwrap(), 0);
+            recovered.close().await.unwrap();
         });
     }
 

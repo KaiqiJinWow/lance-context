@@ -2,6 +2,8 @@
 members = [
     "crates/lance-context-merge",
     "crates/lance-context-core",
+    "crates/lance-context-ingest",
+    "crates/lance-context-wal",
     "crates/lance-context-metrics",
     "crates/lance-context",
     "crates/lance-context-api",
@@ -11,6 +13,7 @@ members = [
     "python",
 ]
 resolver = "2"
+exclude = ["vendor/raft-engine"]
 
 [workspace.package]
 edition = "2021"

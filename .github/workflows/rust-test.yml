@@ -6,6 +6,7 @@ on:
   pull_request:
     paths:
       - crates/**
+      - vendor/raft-engine/**
       - .github/workflows/rust-test.yml
       - Cargo.toml
       - Cargo.lock
@@ -29,8 +30,7 @@ env:
 jobs:
   test:
     runs-on: ubuntu-24.04
-    # The focused HA suite builds a second feature graph after workspace tests;
-    # cold native dependency builds can exhaust 30 minutes before HA tests run.
+    # Keep workspace tests independent of the optional feature build graphs.
     timeout-minutes: 60
     strategy:
       matrix:
@@ -47,9 +47,15 @@ jobs:
           shared-key: "lance-context-deps"
           workspaces: "."
       - name: Install dependencies
+        timeout-minutes: 10
         run: |
-          sudo apt update
-          sudo apt install -y clang libclang-dev protobuf-compiler
+          # Use the official archive directly when the hosted image supplies a mirror list.
+          if [[ -f /etc/apt/apt-mirrors.txt ]]; then
+            sudo sed -i 's|https\?://azure\.archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
+          fi
+          apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+          sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update
+          sudo apt-get "${apt_options[@]}" install -y clang libclang-dev protobuf-compiler
       - name: Build tests
         run: cargo test --workspace --all-targets --no-run
       - name: Run unit and integration tests
@@ -59,6 +65,138 @@ jobs:
         # regression test was dead weight in CI. `--workspace` covers the crates
         # that were silently untested (api, server, client, metrics, the facade).
         run: cargo test --workspace --all-targets
+
+  wal-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup rust toolchain
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "lance-context-wal-deps"
+          workspaces: "."
+      - name: Install dependencies
+        timeout-minutes: 10
+        run: |
+          # Use the official archive directly when the hosted image supplies a mirror list.
+          if [[ -f /etc/apt/apt-mirrors.txt ]]; then
+            sudo sed -i 's|https\?://azure\.archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
+          fi
+          apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+          sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update
+          sudo apt-get "${apt_options[@]}" install -y clang libclang-dev protobuf-compiler
+      - name: WAL component correctness smoke tests
+        run: |
+          cargo run -p lance-context-wal --features lab --bin context-wal-lab -- codec --payload-bytes 1024 --rows 8 --iterations 2
+          cargo test -p lance-context-wal --features lab --bin context-wal-lab
+          cargo test -p lance-context-wal --features lab --test engine_cache
+          cargo run -p lance-context-wal --features lab --bin context-wal-lab -- disk --directory "$RUNNER_TEMP/wal-disk-smoke" --payload-bytes 1024 --batch 4 --writers 2 --groups-per-writer 2 --rounds 8
+      - name: WAL placement, admission, record, contract and IPC decoding tests
+        run: |
+          cargo test -p lance-context-wal --features placement,admission,ipc,record,arrow-contract,vectored-io --lib
+          cargo test -p lance-context-wal --features arrow-contract,serde_json/preserve_order --lib ingest_contract::arrow
+      - name: WAL experiment process lifecycle tests
+        run: cargo test -p lance-context-wal --features runner --test runner --bin context-wal-resource
+      - name: WAL durable Raft storage tests
+        run: |
+          cargo clippy -p lance-context-wal --features raft-log --all-targets -- -D warnings
+          cargo test -p lance-context-wal --features raft-log --lib --test raft_log --test raft_log_cache_identity --test raft_log_checkpoint --test raft_log_snapshot_install
+      - name: Client journal durability and process recovery
+        run: |
+          cargo clippy -p lance-context-wal --features client-journal --all-targets -- -D warnings
+          cargo test -p lance-context-wal --features client-journal --lib client_journal
+      - name: Replicated WAL quorum, TLS peers and process recovery
+        run: |
+          cargo clippy -p lance-context-wal --features peer-transport --all-targets -- -D warnings
+          cargo test -p lance-context-wal --features peer-transport --lib --test replication_process
+      - name: Standalone WAL service and automatic maintenance
+        run: |
+          cargo clippy -p lance-context-wal --features service --all-targets -- -D warnings
+          cargo test -p lance-context-wal --features service --test node_service
+      - name: WAL resource observation in a container cgroup namespace
+        run: |
+          cargo test -p lance-context-wal --features runner --test resource --no-run --message-format=json > "$RUNNER_TEMP/wal-resource-build.jsonl"
+          wal_resource_test=$(jq -rs '[.[] | select(.reason == "compiler-artifact" and .target.name == "resource" and (.target.kind | index("test")) and .executable != null) | .executable] | unique | if length == 1 then .[0] else error("expected one resource test executable") end' "$RUNNER_TEMP/wal-resource-build.jsonl")
+          # Hosted runners use a host cgroup path. Remount cgroup2 inside private
+          # mount/cgroup namespaces, then drop privileges before running tests.
+          sudo unshare --mount --cgroup --propagation private sh -eu -c '
+            umount /sys/fs/cgroup
+            mount -t cgroup2 cgroup2 /sys/fs/cgroup
+            exec setpriv --reuid "$1" --regid "$2" --clear-groups --no-new-privs "$3"
+          ' sh "$(id -u)" "$(id -g)" "$wal_resource_test"
+
+  lance-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup rust toolchain
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "lance-context-lance-deps"
+          workspaces: "."
+      - name: Install dependencies
+        timeout-minutes: 10
+        run: |
+          # Use the official archive directly when the hosted image supplies a mirror list.
+          if [[ -f /etc/apt/apt-mirrors.txt ]]; then
+            sudo sed -i 's|https\?://azure\.archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
+          fi
+          apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+          sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update
+          sudo apt-get "${apt_options[@]}" install -y clang libclang-dev protobuf-compiler
+      - name: Optional Lance object-store metrics
+        run: |
+          cargo test -p lance-context-core --features lance-io-metrics --test lance_io_metrics
+          cargo test -p lance-context-core --all-features --lib latency_histograms_carry_only_bounded_labels
+          cargo check -p lance-context-server --features lance-io-metrics
+          cargo check -p lance-context-core --no-default-features
+      - name: Prepared WAL descriptors with real Lance files and process recovery
+        run: |
+          cargo test -p lance-context-wal --features lance-integration --lib replication::publication::lance
+          cargo test -p lance-context-wal --features lance-integration --test replication_process lance_publication
+
+  ha-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup rust toolchain
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "lance-context-ha-deps"
+          workspaces: "."
+      - name: Install dependencies
+        timeout-minutes: 10
+        run: |
+          # Use the official archive directly when the hosted image supplies a mirror list.
+          if [[ -f /etc/apt/apt-mirrors.txt ]]; then
+            sudo sed -i 's|https\?://azure\.archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
+          fi
+          apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+          sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update
+          sudo apt-get "${apt_options[@]}" install -y clang libclang-dev protobuf-compiler
+      - name: Rollout materialization through the WAL client
+        run: |
+          cargo clippy -p lance-context-ingest --features materializer --all-targets -- -D warnings
+          cargo test -p lance-context-ingest --features materializer --lib
+      - name: HTTP ingestion and recoverable producer journal
+        run: |
+          cargo clippy -p lance-context-ingest --features http --all-targets -- -D warnings
+          cargo clippy -p lance-context-ingest --features http-client,materializer --all-targets -- -D warnings
+          cargo test -p lance-context-ingest --features http-client,materializer --lib
+      - name: Materializer worker feature checks
+        run: cargo clippy -p lance-context-ingest --features worker --all-targets -- -D warnings
       - name: Start etcd for HA scheduler test
         run: |
           ETCD_VERSION=3.7.0
@@ -86,6 +224,27 @@ jobs:
         run: |
           cargo test -p lance-context-master -p lance-context-server -p lance-context-merge -- --ignored
           cargo test -p lance-context-core registry --lib -- --ignored
+          cargo test -p lance-context-ingest --features worker --lib tests::worker -- --ignored
+
+      - name: Ingestion application process recovery
+        env:
+          ETCD_TEST_ENDPOINTS: http://127.0.0.1:2379
+          INGEST_TEST_BIN: ${{ github.workspace }}/target/debug/lance-context-ingest
+          INGEST_TEST_ARTIFACTS: ${{ runner.temp }}/ingest-application
+        run: |
+          mkdir -p "$INGEST_TEST_ARTIFACTS"
+          cargo build -p lance-context-ingest --features service,http-client --bin lance-context-ingest
+          cargo clippy -p lance-context-ingest --features service,http-client --all-targets -- -D warnings
+          cargo test -p lance-context-ingest --features service,http-client --lib tests::reader
+          cargo test -p lance-context-ingest --features service,http-client --lib tests::application -- --ignored
+      - name: Save ingestion application failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ingest-application-failure-logs
+          path: ${{ runner.temp }}/ingest-application/**/*.log
+          if-no-files-found: ignore
+          retention-days: 7
 
   coverage:
     runs-on: ubuntu-24.04
@@ -104,9 +263,15 @@ jobs:
           shared-key: "lance-context-coverage"
           workspaces: "."
       - name: Install dependencies
+        timeout-minutes: 10
         run: |
-          sudo apt update
-          sudo apt install -y clang libclang-dev protobuf-compiler
+          # Use the official archive directly when the hosted image supplies a mirror list.
+          if [[ -f /etc/apt/apt-mirrors.txt ]]; then
+            sudo sed -i 's|https\?://azure\.archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
+          fi
+          apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+          sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update
+          sudo apt-get "${apt_options[@]}" install -y clang libclang-dev protobuf-compiler
       - uses: taiki-e/install-action@cargo-llvm-cov
       - name: Start etcd for HA scheduler test
         run: |
@@ -129,7 +294,20 @@ jobs:
       - name: Clean stale coverage profile data
         run: cargo llvm-cov clean --workspace
       - name: Collect coverage (unit and integration tests)
-        run: cargo llvm-cov --no-report --workspace --all-features
+        run: |
+          # All features include the resource integration test. Give coverage
+          # the same cgroup scope as the ordinary test job, without running
+          # Cargo or test executables as root. Preserve the build configuration.
+          sudo --preserve-env=CARGO_HOME,RUSTUP_HOME,RUSTUP_TOOLCHAIN,RUSTFLAGS,RUST_MIN_STACK,LANCE_MEM_POOL_SIZE,RUST_BACKTRACE,CARGO_INCREMENTAL \
+            unshare --mount --cgroup --propagation private sh -eu -c '
+              umount /sys/fs/cgroup
+              mount -t cgroup2 cgroup2 /sys/fs/cgroup
+              wal_test_uid=$1
+              wal_test_gid=$2
+              shift 2
+              exec setpriv --reuid "$wal_test_uid" --regid "$wal_test_gid" --clear-groups --no-new-privs "$@"
+            ' sh "$(id -u)" "$(id -g)" env "HOME=$HOME" "PATH=$PATH" \
+            cargo llvm-cov --no-report --workspace --all-features
       - name: Collect coverage (etcd-backed ignored tests)
         env:
           ETCD_TEST_ENDPOINTS: http://127.0.0.1:2379
@@ -138,6 +316,8 @@ jobs:
             -p lance-context-master -p lance-context-server -p lance-context-merge -- --ignored
           cargo llvm-cov --no-report --all-features \
             -p lance-context-core --lib -- registry --ignored
+          cargo llvm-cov --no-report --all-features \
+            -p lance-context-ingest --lib -- tests::worker --ignored
       - name: Merge coverage reports
         run: cargo llvm-cov report --lcov --output-path lcov.info
       - name: Save coverage report

@@ -22,10 +22,17 @@ use tokio::sync::{oneshot, Notify};
 
 tokio::task_local! { static CURRENT: Arc<MergeWriteScope>; }
 tokio::task_local! { static EXPECTED_BASE_VERSION: u64; }
+tokio::task_local! { static INITIAL_DATASET_CREATE: (); }
 
 /// Pin the next publication without replacing a dataset's captured owner guard.
 pub(crate) async fn at_base_version<F: Future>(version: u64, work: F) -> F::Output {
     EXPECTED_BASE_VERSION.scope(version, work).await
+}
+
+/// A racing create may only publish version one. This is scoped to the create
+/// future so the returned dataset remains usable for subsequent normal writes.
+pub(crate) async fn at_initial_version<F: Future>(work: F) -> F::Output {
+    INITIAL_DATASET_CREATE.scope((), work).await
 }
 
 #[derive(Debug, Default)]
@@ -99,15 +106,37 @@ pub struct MergeWriteScope {
     completed_steps: Arc<AtomicU64>,
     work: Mutex<MergeWork>,
     observe_file_io: bool,
+    /// Legacy diagnostics must not introduce detached storage tasks or alter
+    /// cancellation/slot lifetimes before durable ownership is available.
+    observation_only: bool,
     local_io: Mutex<Vec<(lance_io::utils::tracking_store::IOTracker, u64)>>,
     progress: Mutex<Progress>,
     changed: Notify,
     authorizer: Option<Arc<dyn CommitAuthorizer>>,
     pin_opened_handles: bool,
     leaves: Mutex<Vec<tokio::task::AbortHandle>>,
+    /// Test-only storage shim applied **beneath** the progress wrapper, so a
+    /// delayed or frozen store is still observed as real IO by the watchdog.
+    io_shim: Option<Arc<dyn lance_io::object_store::WrappingObjectStore>>,
+}
+
+/// Local write observations, not a durable fence or proof of remote quiescence.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct MergeWriteStatus {
+    pub active_commits: usize,
+    pub admission_closed: bool,
+    pub uncertain_commit: bool,
 }
 
 impl MergeWriteScope {
+    pub fn write_status(&self) -> MergeWriteStatus {
+        let progress = self.progress.lock().unwrap();
+        MergeWriteStatus {
+            active_commits: progress.active,
+            admission_closed: progress.closed,
+            uncertain_commit: progress.uncertain,
+        }
+    }
     pub fn work(&self) -> MergeWork {
         self.work.lock().unwrap().clone()
     }
@@ -127,6 +156,13 @@ impl MergeWriteScope {
     }
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    pub fn for_legacy_observation() -> Arc<Self> {
+        Arc::new(Self {
+            observation_only: true,
+            ..Self::default()
+        })
     }
 
     pub fn with_authorizer(authorizer: Arc<dyn CommitAuthorizer>) -> Arc<Self> {
@@ -154,6 +190,22 @@ impl MergeWriteScope {
             authorizer: Some(authorizer),
             pin_opened_handles: true,
             observe_file_io: true,
+            ..Self::default()
+        })
+    }
+
+    /// Preparation scope whose object stores are wrapped by `shim` under the
+    /// progress wrapper. For tests that delay or freeze storage beneath a
+    /// real build to prove the watchdog judges actual IO.
+    pub fn with_preparation_authorizer_and_io_shim(
+        authorizer: Arc<dyn CommitAuthorizer>,
+        shim: Arc<dyn lance_io::object_store::WrappingObjectStore>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            authorizer: Some(authorizer),
+            pin_opened_handles: true,
+            observe_file_io: true,
+            io_shim: Some(shim),
             ..Self::default()
         })
     }
@@ -215,6 +267,18 @@ pub(crate) fn wal_batch_read(rows: usize, bytes: usize) {
 }
 
 pub(crate) fn base_committed() {
+    // Legacy observation counts at the commit handler, including fallback
+    // paths which also invoke the owned executor's logical checkpoints.
+    if CURRENT
+        .try_with(|scope| scope.observation_only)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    record_base_commit();
+}
+
+fn record_base_commit() {
     let _ = CURRENT.try_with(|scope| {
         let mut work = scope.work.lock().unwrap();
         work.base_commits += 1;
@@ -224,6 +288,16 @@ pub(crate) fn base_committed() {
 }
 
 pub(crate) fn generations_reclaimed(count: usize) {
+    if CURRENT
+        .try_with(|scope| scope.observation_only)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    record_reclaimed(count);
+}
+
+fn record_reclaimed(count: usize) {
     if count == 0 {
         return;
     }
@@ -273,13 +347,48 @@ pub(crate) fn preparation_store_wrapper(
     CURRENT
         .try_with(|scope| {
             scope.observe_file_io.then(|| {
-                Arc::new(crate::preparation_io::ProgressWrapper(
-                    scope.completed_steps.clone(),
-                )) as Arc<dyn lance_io::object_store::WrappingObjectStore>
+                let progress: Arc<dyn lance_io::object_store::WrappingObjectStore> = Arc::new(
+                    crate::preparation_io::ProgressWrapper(scope.completed_steps.clone()),
+                );
+                match &scope.io_shim {
+                    // Progress outermost: it counts the shimmed store's
+                    // completed operations, exactly as it would real storage.
+                    Some(shim) => Arc::new(Layered {
+                        outer: progress,
+                        inner: shim.clone(),
+                    })
+                        as Arc<dyn lance_io::object_store::WrappingObjectStore>,
+                    None => progress,
+                }
             })
         })
         .ok()
         .flatten()
+}
+
+#[derive(Debug)]
+struct Layered {
+    outer: Arc<dyn lance_io::object_store::WrappingObjectStore>,
+    inner: Arc<dyn lance_io::object_store::WrappingObjectStore>,
+}
+
+impl lance_io::object_store::WrappingObjectStore for Layered {
+    fn wrap_paginated(
+        &self,
+        name: &str,
+        original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        self.inner
+            .wrap_paginated(name, original)
+            .and_then(|inner| self.outer.wrap_paginated(name, inner))
+    }
+    fn wrap(
+        &self,
+        name: &str,
+        original: Arc<dyn object_store::ObjectStore>,
+    ) -> Arc<dyn object_store::ObjectStore> {
+        self.outer.wrap(name, self.inner.wrap(name, original))
+    }
 }
 
 pub(crate) fn observes_preparation_io() -> bool {
@@ -362,6 +471,18 @@ where
         scope,
         completed: false,
     };
+    if active.scope.observation_only {
+        let mut active = active;
+        let result = write.await;
+        if progressed(&result) {
+            active.scope.completed_steps.fetch_add(1, Ordering::Relaxed);
+        }
+        if result.is_err() {
+            active.scope.mark_uncertain();
+        }
+        active.completed = true;
+        return result;
+    }
     let (send, receive) = oneshot::channel();
     let leaf = tokio::spawn(async move {
         let mut active = active;
@@ -394,7 +515,7 @@ pub(crate) async fn drain_generations(
     let resource = format!("shard:{}", store.shard_id());
     for _ in 0..10 {
         let mut next = store
-            .read_latest()
+            .refresh_latest()
             .await?
             .ok_or_else(|| Error::io("Shard manifest not found"))?;
         if next.writer_epoch != epoch {
@@ -404,17 +525,19 @@ pub(crate) async fn drain_generations(
             .version
             .checked_add(1)
             .ok_or_else(|| Error::io("manifest version overflow"))?;
-        next.flushed_generations
+        let before = next.sstables.len();
+        next.sstables
             .retain(|g| !generations.contains(&g.generation));
+        let removed = before - next.sstables.len();
         authorize(&resource, next.version).await?;
         let writer = store.clone();
         let scope = CURRENT.try_with(Arc::clone).ok();
         let (next, written) = shield_observed(
             async move {
-                let written = writer.write(&next).await;
+                let written = commit_exact_shard(&writer, &next).await;
                 if written
                     .as_ref()
-                    .is_err_and(|e| !e.to_string().contains("already exists"))
+                    .is_err_and(|e| !matches!(e, Error::RetryableCommitConflict { .. }))
                 {
                     if let Some(scope) = scope {
                         scope.mark_uncertain();
@@ -426,12 +549,45 @@ pub(crate) async fn drain_generations(
         )
         .await?;
         match written {
-            Ok(_) => return Ok(next),
-            Err(error) if error.to_string().contains("already exists") => continue,
+            Ok(_) => {
+                if CURRENT
+                    .try_with(|scope| scope.observation_only)
+                    .unwrap_or(false)
+                {
+                    record_reclaimed(removed);
+                }
+                return Ok(next);
+            }
+            Err(Error::RetryableCommitConflict { .. }) => continue,
             Err(error) => return Err(error),
         }
     }
     Err(Error::io("shard drain exceeded conditional-write retries"))
+}
+
+/// Adapt Lance's retrying update API to one previously authorized version.
+/// Returning the SAME manifest on a retry makes Lance's successor check reject
+/// a moved predecessor before any new PUT; the caller must authorize again.
+pub(crate) async fn commit_exact_shard(
+    store: &lance::dataset::mem_wal::ShardManifestStore,
+    next: &lance_index::mem_wal::ShardManifest,
+) -> Result<lance_index::mem_wal::ShardManifest> {
+    let moved = std::sync::atomic::AtomicBool::new(false);
+    let result = store
+        .commit_update(next.writer_epoch, |current| {
+            if current.version.checked_add(1) != Some(next.version) {
+                moved.store(true, Ordering::Relaxed);
+            }
+            next.clone()
+        })
+        .await;
+    if result.is_err() && moved.load(Ordering::Relaxed) {
+        return Err(Error::retryable_commit_conflict_source(
+            next.version,
+            "shard manifest predecessor changed; reauthorize".into(),
+        ));
+    }
+    result
 }
 
 /// The owned protocol is supported only with immutable conditional manifest
@@ -524,7 +680,7 @@ pub async fn fence_manifest_versions(
         let mut fenced = false;
         for _ in 0..64 {
             let mut next = store
-                .read_latest()
+                .refresh_latest()
                 .await?
                 .ok_or_else(|| Error::io("Shard manifest missing during recovery"))?;
             if next.version > *high {
@@ -535,9 +691,9 @@ pub async fn fence_manifest_versions(
                 .version
                 .checked_add(1)
                 .ok_or_else(|| Error::io("manifest version overflow"))?;
-            match store.write(&next).await {
+            match commit_exact_shard(&store, &next).await {
                 Ok(_) => {}
-                Err(error) if error.to_string().contains("already exists") => {}
+                Err(Error::RetryableCommitConflict { .. }) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -581,6 +737,18 @@ impl CommitHandler for GuardedCommit {
         transaction: Option<Transaction>,
     ) -> std::result::Result<ManifestLocation, CommitError> {
         let work = async {
+            if INITIAL_DATASET_CREATE
+                .try_with(|()| manifest.version != 1)
+                .unwrap_or(false)
+            {
+                // Lance can rebase a raced Create into an overwrite of the
+                // winner. Reject before the inner commit, without inviting
+                // another conflict retry or retaining a restriction on the
+                // returned dataset handle.
+                return Err(CommitError::OtherError(Error::invalid_input(
+                    "dataset creation cannot publish a successor manifest",
+                )));
+            }
             if EXPECTED_BASE_VERSION
                 .try_with(|version| manifest.version != *version)
                 .unwrap_or(false)
@@ -620,6 +788,13 @@ impl CommitHandler for GuardedCommit {
             )
             .await?;
             *manifest = committed;
+            if location.is_ok()
+                && CURRENT
+                    .try_with(|scope| scope.observation_only)
+                    .unwrap_or(false)
+            {
+                record_base_commit();
+            }
             location
         };
         match &self.scope {
@@ -690,9 +865,52 @@ impl CommitHandler for GuardedCommit {
 }
 
 #[cfg(test)]
+#[path = "merge_write_scope/create_tests.rs"]
+mod create_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[tokio::test]
+    async fn legacy_observation_retains_uncertainty_without_detaching_storage() {
+        struct LocalWrite(Arc<AtomicBool>);
+        impl Drop for LocalWrite {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let scope = MergeWriteScope::for_legacy_observation();
+        let writing = Arc::new(AtomicBool::new(false));
+        let flag = writing.clone();
+        let (entered, began) = oneshot::channel();
+        let run_scope = scope.clone();
+        let caller = tokio::spawn(async move {
+            run_scope
+                .run(shield(async move {
+                    flag.store(true, Ordering::SeqCst);
+                    let _local_write = LocalWrite(flag);
+                    entered.send(()).unwrap();
+                    std::future::pending::<Result<()>>().await
+                }))
+                .await
+        });
+        began.await.unwrap();
+        assert_eq!(scope.write_status().active_commits, 1);
+        caller.abort();
+        caller.await.unwrap_err();
+        assert!(
+            !writing.load(Ordering::SeqCst),
+            "diagnostics must not detach storage work"
+        );
+        assert_eq!(scope.write_status().active_commits, 0);
+        assert!(
+            scope.write_status().uncertain_commit,
+            "remote completion is still unknown"
+        );
+        assert_eq!(scope.completed_steps(), 0);
+    }
 
     #[tokio::test]
     async fn phase_changes_and_observation_do_not_count_as_completed_work() {
@@ -837,6 +1055,8 @@ mod tests {
         began.await.unwrap();
         merge.abort();
         assert!(merge.await.unwrap_err().is_cancelled());
+        assert_eq!(scope.write_status().active_commits, 1);
+        assert!(!scope.write_status().uncertain_commit);
         let draining_scope = scope.clone();
         let drain = tokio::spawn(async move { draining_scope.drain().await });
         tokio::task::yield_now().await;
@@ -846,6 +1066,8 @@ mod tests {
         );
         release.send(()).unwrap();
         drain.await.unwrap();
+        assert_eq!(scope.write_status().active_commits, 0);
+        assert!(scope.write_status().admission_closed);
         assert!(committed.load(Ordering::SeqCst));
         assert!(!scope.has_uncertain_commit());
         assert!(

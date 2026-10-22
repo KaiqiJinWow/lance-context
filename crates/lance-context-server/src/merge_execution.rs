@@ -1,5 +1,8 @@
 //! HTTP handlers only admit/cancel work. The owned executor, not the connection,
 //! holds the durable execution fence until the scoped storage future is gone.
+mod background;
+pub(crate) use background::{publish_background_request, spawn_background};
+
 use crate::{
     error::AppError,
     routes::{generic, rollouts},
@@ -44,10 +47,24 @@ impl lance_context_core::merge_write_scope::CommitAuthorizer for OwnedCommitGuar
     }
 }
 
+#[derive(Default)]
+pub(crate) struct WorkerAdmission {
+    pub writer_id: Option<String>,
+    pub enable_fencing: bool,
+}
+
 pub struct Executions {
+    pub(crate) legacy: crate::legacy_merge::LegacyMerges,
     coordinator: OnceCell<Coordinator>,
     etcd: Option<lance_context_merge::EtcdConfig>,
     pub(crate) rollout: lance_context_merge::rollout::MergeRollout,
+    endpoint: Option<String>,
+    worker_admission: WorkerAdmission,
+    fencing_mode: OnceCell<bool>,
+    mode_pending: std::sync::atomic::AtomicBool,
+    background_targets: std::sync::Mutex<std::collections::HashSet<String>>,
+    request_targets: std::sync::Mutex<std::collections::HashSet<String>>,
+    request_slots: Arc<tokio::sync::Semaphore>,
     queue_timeout_secs: u64,
     idle_timeout_secs: u64,
     instance: String,
@@ -59,9 +76,17 @@ impl Executions {
     #[cfg(test)]
     pub fn new(coordinator: Option<Coordinator>, timeout_secs: u64) -> Self {
         Self {
+            legacy: Default::default(),
             coordinator: OnceCell::new_with(coordinator),
             etcd: None,
             rollout: Default::default(),
+            endpoint: None,
+            worker_admission: WorkerAdmission::default(),
+            fencing_mode: OnceCell::new(),
+            mode_pending: std::sync::atomic::AtomicBool::new(false),
+            background_targets: Default::default(),
+            request_targets: Default::default(),
+            request_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             queue_timeout_secs: 600,
             idle_timeout_secs: 600,
             instance: uuid::Uuid::new_v4().to_string(),
@@ -69,23 +94,98 @@ impl Executions {
             running: Mutex::new(HashMap::new()),
         }
     }
-    pub fn configured(
+    pub(crate) fn configured(
         etcd: lance_context_merge::EtcdConfig,
         rollout: lance_context_merge::rollout::MergeRollout,
+        endpoint: Option<String>,
         timeout_secs: u64,
         queue_timeout_secs: u64,
         idle_timeout_secs: u64,
+        worker_admission: WorkerAdmission,
     ) -> Self {
         Self {
+            legacy: Default::default(),
             coordinator: OnceCell::new(),
             etcd: Some(etcd),
             rollout,
+            endpoint,
+            worker_admission,
+            fencing_mode: OnceCell::new(),
+            mode_pending: std::sync::atomic::AtomicBool::new(false),
+            background_targets: Default::default(),
+            request_targets: Default::default(),
+            request_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             timeout_secs,
             queue_timeout_secs,
             idle_timeout_secs,
             instance: uuid::Uuid::new_v4().to_string(),
             running: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Unknown mode defers maintenance, never ingestion. An activated protocol
+    /// is persisted so a configuration rollback cannot reopen untracked writes.
+    pub(crate) fn fencing_mode_known(&self) -> Option<bool> {
+        if !self.rollout.fence_legacy
+            && !self.worker_admission.enable_fencing
+            && self.coordinator.get().is_none()
+            && self
+                .etcd
+                .as_ref()
+                .is_none_or(|c| c.etcd_endpoints.is_empty())
+        {
+            return Some(false);
+        }
+        self.fencing_mode.get().copied()
+    }
+
+    pub(crate) async fn fenced_mode(&self) -> Result<bool, AppError> {
+        if let Some(mode) = self.fencing_mode_known() {
+            return Ok(mode);
+        }
+        self.fencing_mode.get_or_try_init(|| async {
+            let coordinator = self.coordinator().await?;
+            let cluster_mode = coordinator.legacy_fencing_mode(self.rollout.fence_legacy)
+                .await.map_err(AppError::Internal)?;
+            let mode = match self.worker_admission.writer_id.as_deref() {
+                Some(writer) => coordinator.worker_fencing_mode(writer, self.worker_admission.enable_fencing)
+                    .await.map_err(AppError::Internal)?,
+                None if self.worker_admission.enable_fencing => return Err(AppError::InvalidRequest("worker fencing requires a stable writer identity".into())),
+                None => cluster_mode,
+            };
+            if mode && self.endpoint.is_none() {
+                return Err(AppError::InvalidRequest("persisted merge protocol requires MERGE_EXECUTOR_ENDPOINT; refusing legacy rollback".into()));
+            }
+            Ok(mode)
+        }).await.copied()
+    }
+
+    pub(crate) fn resolve_mode_in_background(state: Arc<AppState>) {
+        use std::sync::atomic::Ordering;
+        if state.merge_executions.fencing_mode_known().is_some()
+            || state
+                .merge_executions
+                .mode_pending
+                .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        tokio::spawn(async move {
+            if let Err(error) = state.merge_executions.fenced_mode().await {
+                tracing::warn!(
+                    ?error,
+                    "merge protocol unresolved; ingestion continues, untracked merges deferred"
+                );
+            }
+            state
+                .merge_executions
+                .mode_pending
+                .store(false, Ordering::SeqCst);
+        });
+    }
+
+    pub(crate) fn instance(&self) -> &str {
+        &self.instance
     }
 
     pub(crate) fn owned(&self, target: &str) -> bool {
@@ -148,12 +248,16 @@ impl Executions {
 pub async fn capabilities(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    Executions::resolve_mode_in_background(state.clone());
     Ok(Json(
         serde_json::json!({"protocol": 2, "instance": state.merge_executions.instance,
         "timeout_secs": state.merge_executions.timeout_secs,
         "queue_timeout_secs": state.merge_executions.queue_timeout_secs,
         "idle_timeout_secs": state.merge_executions.idle_timeout_secs,
         "progress_protocol": 1,
+        "legacy_progress_protocol": 1,
+        "merge_admission_ready": state.merge_executions.fencing_mode_known().is_some(),
+        "fenced_legacy_merges": state.merge_executions.fencing_mode_known() == Some(true),
         "rollout_append_protocol": 1,
         "shard_name": state.instance_id,
         "owned_targets": state.merge_executions.rollout.owned_targets,
@@ -161,12 +265,52 @@ pub async fn capabilities(
     ))
 }
 
+/// A replacement must resolve both the persisted admission mode and the exact
+/// old execution from its own coordinator before legacy retirement can proceed.
+#[derive(serde::Deserialize)]
+pub struct RetirementQuery {
+    target: String,
+}
+
+pub async fn retirement_status(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(query): axum::extract::Query<RetirementQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if query.target.is_empty() || query.target.len() > 512 {
+        return Err(AppError::InvalidRequest(
+            "one explicit retirement target is required".into(),
+        ));
+    }
+    if !state.merge_executions.fenced_mode().await? {
+        return Err(AppError::Overloaded(
+            "replacement must fence all legacy merge admission".into(),
+        ));
+    }
+    let execution = state
+        .merge_executions
+        .coordinator()
+        .await?
+        .get(&query.target)
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(Json(serde_json::json!({
+        "instance": state.merge_executions.instance,
+        "base_uri": state.base_uri,
+        "shard_name": state.instance_id,
+        "fenced_legacy_merges": true,
+        "execution": execution,
+    })))
+}
+
 pub async fn start(
     State(state): State<Arc<AppState>>,
     Json(execution): Json<Execution>,
 ) -> Result<StatusCode, AppError> {
     let coordinator = state.merge_executions.coordinator().await?;
-    if !state.merge_executions.owned(&execution.target)
+    if (!state.merge_executions.owned(&execution.target)
+        && !state.merge_executions.fenced_mode().await?)
+        || state.merge_executions.rollout.draining(&execution.target)
+        || execution.background
         || execution.maintenance.is_some()
         || execution.protocol != 2
         || execution.instance != state.merge_executions.instance
@@ -197,7 +341,14 @@ pub async fn start(
     // never leave a Running fence without an executor (or cancel a live write).
     let owned = state.clone();
     tokio::spawn(async move {
-        let result = run(owned.clone(), coordinator, execution.clone(), cancelled).await;
+        let result = run(
+            owned.clone(),
+            coordinator,
+            execution.clone(),
+            cancelled,
+            None,
+        )
+        .await;
         if let Err(error) = result {
             tracing::error!(id = %execution.id, target = %execution.target, %error, "merge execution ownership unresolved");
         }
@@ -216,6 +367,7 @@ async fn run(
     coordinator: Coordinator,
     execution: Execution,
     cancelled: watch::Receiver<bool>,
+    mut slot: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<(), String> {
     // CAS errors are ambiguous: never retry storage work. Reconciliation sees
     // the durable fence, so an uncertain admission cannot release ownership.
@@ -238,7 +390,6 @@ async fn run(
         tokio::time::sleep(Duration::from_secs(1)).await;
     };
     let target = execution.target.clone();
-    let mut slot = None;
     let uri = match target.strip_prefix("generic:") {
         Some(name) => state.generic_uri(name),
         None => state.rollout_uri(&target),
@@ -285,13 +436,15 @@ async fn run(
     // not exceed the compiler's async layout recursion limit.
     let execute: futures::future::BoxFuture<'_, Result<usize, String>> = Box::pin(async {
         // No payload work starts before admission to the process-wide slot.
-        slot = execute_scoped(
-            async { Ok(state.acquire_merge_slot().await) },
-            Duration::from_secs(execution.queue_timeout_secs),
-            cancelled.clone(),
-        )
-        .await
-        .map_err(|e| format!("merge queue wait: {e}"))?;
+        if slot.is_none() {
+            slot = execute_scoped(
+                async { Ok(state.acquire_merge_slot().await) },
+                Duration::from_secs(execution.queue_timeout_secs),
+                cancelled.clone(),
+            )
+            .await
+            .map_err(|e| format!("merge queue wait: {e}"))?;
+        }
         if !coordinator.publish_progress(&running, 0).await? {
             return Err("merge ownership revoked before execution".into());
         }
@@ -471,7 +624,7 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
-    async fn unavailable_etcd_does_not_block_startup_or_disable_legacy_self_merge() {
+    async fn unavailable_etcd_does_not_block_startup_or_flush_configuration() {
         use clap::Parser;
         let dir = tempfile::tempdir().unwrap();
         let config = crate::config::ServerConfig::parse_from([
@@ -495,6 +648,14 @@ mod tests {
         assert!(state.merge_executions.legacy_allowed("hot").is_err());
         let Json(reply) = capabilities(State(state.clone())).await.unwrap();
         assert_eq!(reply["owned_targets"][0], "hot");
+        assert_eq!(reply["legacy_progress_protocol"], 1);
+        let Json(progress) = crate::legacy_merge::status(
+            State(state.clone()),
+            axum::extract::Query(Default::default()),
+        )
+        .await;
+        assert_eq!(progress["instance"], reply["instance"]);
+        assert_eq!(progress["snapshot"]["takeover_authorized"], false);
         assert!(state.merge_executions.coordinator.get().is_none());
     }
 
@@ -542,6 +703,68 @@ mod tests {
         .await
         .unwrap();
         (state, coordinator, proof, dir)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn legacy_retirement_status_resolves_mode_and_returns_exact_coordinator_record() {
+        let (mut state, coordinator, proof, _dir) = deadline_fixture().await;
+        let local = Arc::get_mut(&mut state).unwrap();
+        local.merge_executions.worker_admission = WorkerAdmission {
+            writer_id: Some("worker-9".into()),
+            enable_fencing: true,
+        };
+        local.merge_executions.endpoint = Some("http://replacement:3000".into());
+        local.instance_id = Some("worker-9".into());
+        let execution = coordinator
+            .admit_legacy(&proof, "hot", "http://old:3000")
+            .await
+            .unwrap();
+        let Json(reply) = retirement_status(
+            State(state.clone()),
+            axum::extract::Query(RetirementQuery {
+                target: "hot".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply["fenced_legacy_merges"], true);
+        assert_eq!(
+            reply["execution"],
+            serde_json::to_value(&execution).unwrap()
+        );
+        assert_eq!(reply["base_uri"], state.base_uri);
+        assert_eq!(reply["shard_name"], "worker-9");
+        assert_eq!(coordinator.get("hot").await.unwrap(), Some(execution));
+        assert!(coordinator
+            .worker_fencing_mode("worker-9", false)
+            .await
+            .unwrap());
+        assert!(!coordinator
+            .worker_fencing_mode("worker-8", false)
+            .await
+            .unwrap());
+        assert!(!coordinator.legacy_fencing_mode(false).await.unwrap());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated local ETCD_TEST_ENDPOINTS"]
+    async fn legacy_retirement_status_rejects_unfenced_replacement() {
+        let (state, coordinator, proof, _dir) = deadline_fixture().await;
+        let execution = coordinator
+            .admit_legacy(&proof, "hot", "http://old:3000")
+            .await
+            .unwrap();
+        assert!(retirement_status(
+            State(state),
+            axum::extract::Query(RetirementQuery {
+                target: "hot".into()
+            })
+        )
+        .await
+        .is_err());
+        assert_eq!(coordinator.get("hot").await.unwrap(), Some(execution));
+        assert!(!coordinator.legacy_fencing_mode(false).await.unwrap());
     }
 
     async fn terminal(coordinator: &Coordinator) -> Execution {

@@ -297,8 +297,35 @@ pub async fn merge_generic_wal(
     state
         .merge_executions
         .legacy_allowed(&format!("generic:{name}"))?;
-    let _slot = state.acquire_merge_slot().await;
-    merge_generic_wal_owned(State(state), Path(name)).await
+    if state.merge_executions.fenced_mode().await? {
+        crate::merge_execution::publish_background_request(
+            state.clone(),
+            format!("generic:{name}"),
+        );
+        let result =
+            crate::merge_execution::spawn_background(state, format!("generic:{name}")).await?;
+        let reclaimed = result
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?
+            .map_err(AppError::Internal)?;
+        return Ok(Json(serde_json::json!({"reclaimed": reclaimed})));
+    }
+    let execution_state = state.clone();
+    let execution_name = name.clone();
+    state
+        .merge_executions
+        .legacy
+        .run(
+            &format!("generic:{name}"),
+            "http",
+            true,
+            |started| async move {
+                let _slot = execution_state.acquire_merge_slot().await;
+                started.running();
+                merge_generic_wal_owned(State(execution_state.clone()), Path(execution_name)).await
+            },
+        )
+        .await
 }
 
 pub(crate) async fn merge_generic_wal_owned(
@@ -306,12 +333,14 @@ pub(crate) async fn merge_generic_wal_owned(
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let store = state.get_or_open_generic_store(&name).await?;
+    let merge_gate = { store.read().await.merge_preparation_gate() };
+    let _merge = merge_gate.lock().await;
     // Same prepare/commit split as the sweeper: the object-storage read of the
     // generations runs under the shared lock so the store keeps serving.
     let prepared = {
         let guard = store.read().await;
         guard
-            .prepare_cleanup_merge()
+            .prepare_recovered_cleanup_merge()
             .await
             .map_err(AppError::from_lance)?
     };

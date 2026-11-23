@@ -18,9 +18,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use lance_context_core::{DatagenStore, GenericStore, RolloutStore};
+use lance_context_core::{ContextStore, DatagenStore, GenericStore, RolloutStore};
 use lru::LruCache;
 use tokio::sync::{Mutex, RwLock, Semaphore};
+
+#[cfg(test)]
+mod context_tests;
 
 /// A deferred observation. Outer `None` means the cached store was evicted.
 type DemandProbe = futures::future::BoxFuture<
@@ -81,8 +84,8 @@ pub(crate) trait Sweepable: Clone + Send + Sync + 'static {
         Box::pin(async { Some(Ok(None)) })
     }
 
-    /// Fold **every** pending flushed generation into the base table; returns
-    /// how many were reclaimed.
+    /// Merge a bounded prefix of pending generations into the base table;
+    /// returns how many were merged.
     fn merge_wal(&self) -> impl std::future::Future<Output = Result<usize, String>> + Send;
 }
 
@@ -159,6 +162,36 @@ impl Sweepable for Arc<RwLock<RolloutStore>> {
                 .map_err(|e| e.to_string())?
         };
         // Publication, key deletion and drain retain the exclusive store guard.
+        let Some((manifest_store, manifest, prepared)) = prepared else {
+            return Ok(0);
+        };
+        let mut guard = self.write().await;
+        guard
+            .commit_prepared_merge(&manifest_store, &manifest, prepared)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+impl Sweepable for Arc<RwLock<ContextStore>> {
+    fn kind() -> &'static str {
+        "context"
+    }
+
+    async fn flush(&self) -> Result<(), String> {
+        self.read().await.flush().await.map_err(|e| e.to_string())
+    }
+
+    async fn merge_wal(&self) -> Result<usize, String> {
+        let merge_gate = { self.read().await.merge_preparation_gate() };
+        let _merge = merge_gate.lock().await;
+        let prepared = {
+            let guard = self.read().await;
+            guard
+                .prepare_cleanup_merge()
+                .await
+                .map_err(|e| e.to_string())?
+        };
         let Some((manifest_store, manifest, prepared)) = prepared else {
             return Ok(0);
         };

@@ -448,6 +448,9 @@ impl AppState {
     pub(crate) fn context_store_options(&self) -> ContextStoreOptions {
         ContextStoreOptions {
             shard_id: self.instance_id.clone(),
+            merge_max_generations: Some(self.rollout_merge_max_generations),
+            merge_max_bytes: Some(self.rollout_merge_max_bytes),
+            merge_budget: self.merge_budget.clone(),
             ..Default::default()
         }
     }
@@ -1021,10 +1024,10 @@ impl AppState {
     ///
     /// This replaces the former one-timer-per-store model, which does not scale
     /// to hundreds of thousands of per-experiment datasets. On each tick the
-    /// sweeper snapshots the *resident* stores of **every kind** (those in the
-    /// LRUs) and folds each one's flushed MemWAL generations into its base
-    /// table, guarding every pass with a timeout so a wedged store cannot stall
-    /// the sweeper.
+    /// sweeper snapshots the resident stores of every kind (the context map
+    /// and the LRUs) and folds each one's flushed MemWAL generations into its
+    /// base table, guarding every pass with a timeout so a wedged store cannot
+    /// stall the sweeper.
     ///
     /// Covering all kinds is not cosmetic: it previously visited only rollout
     /// stores, so a datagen store's generations accumulated forever and every
@@ -1051,6 +1054,13 @@ impl AppState {
                 let Some(state) = weak.upgrade() else {
                     return;
                 };
+                let context_stores = state
+                    .stores
+                    .read()
+                    .await
+                    .iter()
+                    .map(|(name, store)| (name.clone(), store.clone()))
+                    .collect();
                 // Every kind, not just rollout: generations accumulate in each
                 // one, and only the base table absorbs them. The kinds run
                 // concurrently: each pass is a serial walk with a per-store
@@ -1074,6 +1084,11 @@ impl AppState {
                         pass_timeout,
                         Some(state.clone()),
                     ),
+                    sweeper::merge_pass_coordinated(
+                        context_stores,
+                        pass_timeout,
+                        Some(state.clone()),
+                    ),
                 );
             }
         }))
@@ -1088,9 +1103,9 @@ impl AppState {
     /// flushes each resident store on a fixed interval, bounding
     /// read-after-write latency while keeping the append path concurrent.
     ///
-    /// Applies to every store kind. Rollout and generic stores default to a
-    /// deferred seal and genuinely depend on this; datagen seals on each append,
-    /// so its pass is a no-op in steady state and is kept only for symmetry.
+    /// Rollout and generic stores default to a deferred seal and depend on this;
+    /// datagen seals on each append, so its pass is a no-op in steady state.
+    /// Context stores seal on each append and only join the cleanup sweeper.
     ///
     /// For rollout and generic it also runs the count-triggered merge
     /// ([`sweeper::Sweepable::merge_if_due`]): the read-amplification bound

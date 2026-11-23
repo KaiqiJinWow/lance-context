@@ -98,7 +98,8 @@ pub struct ServerConfig {
     /// Maximum flushed MemWAL generations folded into the base table by one
     /// merge pass. `0` disables this cap; the byte budget still applies.
     /// Leftovers stay pending for the next pass. Both caps apply to count- and
-    /// time-triggered merges of rollout, datagen and generic stores.
+    /// time-triggered merges of rollout, datagen and generic stores, and to
+    /// time-triggered cleanup of context stores.
     #[arg(long, env = "ROLLOUT_MERGE_MAX_GENERATIONS", default_value = "8")]
     pub rollout_merge_max_generations: usize,
 
@@ -172,10 +173,10 @@ pub struct ServerConfig {
     ///
     /// # Applies to every store kind, despite the name
     ///
-    /// The sweeper visits rollout, datagen and generic stores alike — every
-    /// MemWAL-backed store accumulates generations, and only a merge reclaims
-    /// them. The `ROLLOUT_` prefix is historical: these variables predate the
-    /// other store kinds, and renaming them would silently break existing
+    /// The sweeper visits context, rollout, datagen and generic stores alike.
+    /// Every MemWAL-backed store accumulates generations, and only a merge
+    /// reclaims them. The `ROLLOUT_` prefix is historical: these variables predate
+    /// the other store kinds, and renaming them would silently break existing
     /// deployment manifests for no functional gain.
     #[arg(long, env = "ROLLOUT_CLEANUP_INTERVAL_SECS", default_value = "0")]
     pub rollout_cleanup_interval_secs: u64,
@@ -188,10 +189,9 @@ pub struct ServerConfig {
     /// append path is what lets concurrent appends run without serializing
     /// behind a per-append seal. Default `30`.
     ///
-    /// Like the cleanup interval, this applies to **every** store kind despite
-    /// the `ROLLOUT_` prefix. Rollout and generic stores default to a deferred
-    /// seal and depend on it; datagen seals on each append, so its pass is a
-    /// no-op in steady state.
+    /// Rollout and generic stores default to a deferred seal and depend on this;
+    /// datagen seals on each append, so its pass is a no-op in steady state.
+    /// Context stores seal on each append and only join the cleanup sweeper.
     ///
     /// `0` disables periodic flush, leaving the cleanup sweeper
     /// (`ROLLOUT_CLEANUP_INTERVAL_SECS`) as the only thing that seals memtables

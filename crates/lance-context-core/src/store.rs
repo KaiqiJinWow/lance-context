@@ -19,12 +19,14 @@ use arrow_array::{
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Schema, TimeUnit};
 use chrono::{DateTime, Timelike, Utc};
 use futures::TryStreamExt;
+use lance::dataset::mem_wal::ShardManifestStore;
 use lance::dataset::optimize::CompactionMetrics;
 use lance::dataset::Dataset;
 use lance::dataset::NewColumnTransform;
 use lance::index::DatasetIndexExt;
 use lance::io::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry, StorageOptionsAccessor};
 use lance::{Error as LanceError, Result as LanceResult};
+use lance_index::mem_wal::ShardManifest;
 use lance_index::scalar::ScalarIndexParams;
 use lance_index::IndexType;
 use tokio::sync::Mutex;
@@ -39,7 +41,7 @@ use crate::record::{
     LIFECYCLE_CONTRADICTED,
 };
 use crate::serde::CONTENT_TYPE_TOMBSTONE;
-use crate::store_base::{ListSource, StorageBase, StorageBaseOptions};
+use crate::store_base::{ListSource, PreparedMerge, StorageBase, StorageBaseOptions};
 
 /// Embedding length used for the semantic index column.
 const DEFAULT_EMBEDDING_DIM: i32 = 1536;
@@ -2205,11 +2207,37 @@ impl ContextStore {
         self.base.maybe_merge_own_shard().await
     }
 
-    /// Seal, then fold **every** pending flushed generation into the base table.
-    /// The time half of the "time OR count" trigger, so deliberately not gated
-    /// by the count threshold. Returns the number of generations reclaimed.
+    /// Seal, then merge a bounded prefix of this instance's pending generations.
+    /// Runs independently of the count threshold. Returns how many were merged.
     pub async fn cleanup_wal(&mut self) -> LanceResult<usize> {
         self.base.cleanup_own_shard().await
+    }
+
+    /// Serialize split merges. Release the store guard before awaiting this
+    /// gate, then hold the gate through preparation and commit.
+    #[must_use]
+    pub fn merge_preparation_gate(&self) -> Arc<Mutex<()>> {
+        self.base.merge_preparation_gate()
+    }
+
+    /// Prepare a bounded cleanup pass while holding only a shared store lock.
+    /// Seals this instance's active memtable and reads its pending generations.
+    pub async fn prepare_cleanup_merge(
+        &self,
+    ) -> LanceResult<Option<(ShardManifestStore, ShardManifest, PreparedMerge)>> {
+        self.base.prepare_cleanup_merge().await
+    }
+
+    /// Commit a prepared cleanup pass while holding an exclusive store lock.
+    pub async fn commit_prepared_merge(
+        &mut self,
+        manifest_store: &ShardManifestStore,
+        manifest: &ShardManifest,
+        prepared: PreparedMerge,
+    ) -> LanceResult<usize> {
+        self.base
+            .commit_prepared_merge(manifest_store, manifest, prepared)
+            .await
     }
 
     /// Number of flushed MemWAL generations pending merge into the base table,
